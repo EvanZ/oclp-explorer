@@ -1,0 +1,15 @@
+[project]
+site_name = "Cyclops"
+site_description = "A local explorer for Open Computation Lifecycle Protocol records"
+site_url = "https://evanz.github.io/oclp-explorer/"
+repo_url = "https://github.com/EvanZ/oclp-explorer"
+docs_dir = "docs"
+site_dir = "site"
+nav = [
+  {"Overview" = "index.md"},
+  {"Using Cyclops" = "using-cyclops.md"},
+]
+
+[project.theme]
+variant = "modern"
+language = "en"

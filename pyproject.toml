@@ -1,0 +1,48 @@
+[project]
+name = "oclp-explorer"
+version = "0.1.0a0"
+description = "Cyclops, a read-only explorer for Open Computation Lifecycle Protocol records"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+  { name = "Evan Zamir" },
+]
+dependencies = [
+  "fastapi>=0.140.7",
+  "oclp[duckdb] @ git+https://github.com/EvanZ/oclp-python.git@66d294b913433396d25d61a18c504ff43c1df4b3",
+  "uvicorn>=0.51.0",
+]
+
+[project.scripts]
+oclp-explorer = "oclp_explorer.app:main"
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8.3,<9",
+  "ruff>=0.9",
+]
+docs = [
+  "zensical>=0.0.51",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/oclp_explorer"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

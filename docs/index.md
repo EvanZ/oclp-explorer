@@ -5,3 +5,5 @@ Cyclops is a generic, local explorer for Open Computation Lifecycle Protocol
 or protocol producer.
 
 Start with the [Cyclops guide](using-cyclops.md).
+
+For a quick visual introduction, see the [Cyclops tour](tour.md).

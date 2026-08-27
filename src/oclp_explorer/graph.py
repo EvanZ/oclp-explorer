@@ -235,7 +235,9 @@ class OclpProjectGraph:
         ]
         return {
             "view": view,
-            "nodes": [*nodes, *collection_nodes],
+            # Collection members are supplied separately.  The client decides
+            # whether a collection is expanded without changing the Data DAG.
+            "nodes": list(nodes),
             "edges": list(edges),
             "collection_edges": list(collection_edges),
             "collection_nodes": collection_nodes,
@@ -300,16 +302,7 @@ class OclpProjectGraph:
             ],
         }
         if view in {"derivation", "provenance", "run"}:
-            collection_edges = [
-                edge
-                for edge in self.collection_edges
-                if edge["source"] in selected or edge["target"] in selected
-            ]
-            collection_node_ids = {
-                edge["target"]
-                for edge in collection_edges
-                if edge["relation"] == "dataset-partition" and edge["source"] in selected
-            }
+            collection_edges, collection_node_ids = self._collection_overlay(selected)
             collection_nodes = [
                 {
                     **node,
@@ -317,10 +310,6 @@ class OclpProjectGraph:
                 }
                 for node in self.nodes
                 if node["id"] in collection_node_ids
-            ]
-            payload["nodes"] = [
-                *[node for node in nodes if node["id"] in selected],
-                *collection_nodes,
             ]
             payload["collection_edges"] = collection_edges
             payload["collection_nodes"] = collection_nodes
@@ -333,24 +322,22 @@ class OclpProjectGraph:
         self,
         visible_node_ids: set[str],
     ) -> tuple[tuple[dict[str, str], ...], set[str]]:
-        """Return scoped collection edges and profile-defined member nodes.
+        """Return a visible collection's exact member overlay.
 
-        ArtifactSet membership is visible only when both records already belong
-        to the selected computation. A direct dataset-snapshot input instead
-        carries exact partition references in its profile payload, so its
-        partition Artifacts are added as contextual children of the manifest.
+        An ArtifactSet and a dataset-snapshot Artifact are both direct Data
+        DAG nodes.  Their members are inventory context, so a client can
+        reveal or hide them without replacing the collection's real
+        ``consumes`` or ``produces`` edge.  Members outside the selected Data
+        DAG are returned as contextual nodes for an expanded collection.
         """
 
         edges = tuple(
             edge
             for edge in self.collection_edges
             if edge["source"] in visible_node_ids
-            and (edge["target"] in visible_node_ids or edge["relation"] == "dataset-partition")
         )
-        dataset_member_ids = {
-            edge["target"] for edge in edges if edge["relation"] == "dataset-partition"
-        }
-        return edges, dataset_member_ids - visible_node_ids
+        member_ids = {edge["target"] for edge in edges}
+        return edges, member_ids - visible_node_ids
 
     def _view(
         self,

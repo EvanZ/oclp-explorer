@@ -277,9 +277,14 @@ def test_project_graph_accepts_an_artifact_set_invocation_input(tmp_path: Path) 
         (model_package.digest.value, invocation.digest.value, "consumes"),
         (invocation.digest.value, response.digest.value, "produces"),
     }
-    assert model_package.digest.value in {
-        node["id"] for node in graph.graph_payload()["nodes"]
-    }
+    payload = graph.graph_payload()
+    assert model_package.digest.value in {node["id"] for node in payload["nodes"]}
+    assert source.digest.value not in {node["id"] for node in payload["nodes"]}
+    assert {node["id"] for node in payload["collection_nodes"]} == {source.digest.value}
+    assert {
+        (edge["source"], edge["target"], edge["relation"])
+        for edge in payload["collection_edges"]
+    } == {(model_package.digest.value, source.digest.value, "contains")}
 
 
 def test_dataset_snapshot_input_groups_exact_partition_artifacts(tmp_path: Path) -> None:
@@ -364,7 +369,11 @@ def test_dataset_snapshot_input_groups_exact_partition_artifacts(tmp_path: Path)
 
     nodes = {node["id"]: node for node in payload["nodes"]}
     assert nodes[snapshot.digest.value]["collection_kind"] == "dataset-snapshot"
-    assert {first_part.digest.value, second_part.digest.value} <= set(nodes)
+    assert not {first_part.digest.value, second_part.digest.value} & set(nodes)
+    assert {node["id"] for node in payload["collection_nodes"]} == {
+        first_part.digest.value,
+        second_part.digest.value,
+    }
     assert {
         (edge["source"], edge["target"], edge["relation"]) for edge in payload["collection_edges"]
     } == {

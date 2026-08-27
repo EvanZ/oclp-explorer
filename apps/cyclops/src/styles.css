@@ -15,6 +15,8 @@ h2 { font-size: 18px; overflow-wrap: anywhere; }
 .project-summary span { color: var(--muted); }
 .view-controls { align-items: center; display: flex; gap: 0.5rem; }
 .theme-toggle { align-items: center; display: inline-flex; font-weight: 600; gap: 6px; }
+.export-gif { font-weight: 650; }
+.export-gif:disabled { cursor: wait; opacity: 0.72; }
 .view-toggle { border: 1px solid var(--control-border); border-radius: 7px; display: flex; overflow: hidden; }
 .view-toggle button { background: var(--raised); border: 0; border-radius: 0; color: var(--muted); font-weight: 600; padding: 8px 11px; }
 .view-toggle button + button { border-left: 1px solid var(--control-border); }
@@ -58,6 +60,8 @@ h2 { font-size: 18px; overflow-wrap: anywhere; }
 .run-tree-invocation:has(.status-failed) .run-tree-invocation-copy > span { color: #fb7185; }
 .run-tree-empty { color: var(--muted); font-size: 12px; padding: 10px 6px; }
 .graph-panel { min-height: 0; }
+.graph-panel.is-exporting-gif .react-flow__controls,
+.graph-panel.is-exporting-gif .react-flow__minimap { opacity: 0; }
 .detail-panel { background: var(--surface); border-left: 1px solid var(--border); overflow: auto; padding: 18px; }
 .detail-panel > p:not(.eyebrow) { color: var(--muted); line-height: 1.5; margin-top: 14px; }
 .record-id, .store-root { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; overflow-wrap: anywhere; }

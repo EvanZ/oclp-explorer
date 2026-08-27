@@ -15,9 +15,16 @@ hierarchy.
 
 ![Cyclops run explorer showing a customer-data refresh with nested tasks and a release ArtifactSet](images/run-explorer.png)
 
-An ArtifactSet appears as a container around its unshared member Artifacts. It
-organizes a published collection without replacing the underlying Artifact
-records or adding a new execution step.
+An ArtifactSet starts as one collapsed collection node. Its layered backplates,
+member count, and expand chevron make the hidden members visible as a concept
+without showing them individually. Double-click it to reveal its unshared
+member Artifacts inside a containing box, and double-click again to collapse
+them. It organizes a published collection without replacing the underlying
+Artifact records or adding a new execution step.
+
+Use **Export GIF** in the toolbar to download a short loop of the current
+viewport. It is useful for explaining a run in a document or issue without
+making the read-only explorer mutate the OCLP store.
 
 ## Inspect the durable record
 
@@ -35,6 +42,13 @@ nodes stay in place while Cyclops adds the Definition, Events, Evidence, and
 other non-dataflow context recorded for that Invocation.
 
 ![Cyclops provenance view showing a definition, successful invocation, artifacts, events, and evidence](images/provenance.png)
+
+Here is the same idea in an exported dogfood provenance graph. The bright,
+flowing edges are direct Data DAG bindings; the quiet dashed edges add
+Definition, Event, and Evidence context without claiming those records are
+inputs or outputs of the computation.
+
+![Animated Cyclops provenance flow for a 2025-26 RAPM baseline training invocation](images/provenance-flow.gif)
 
 The provenance overlay is deliberately scoped to the selected Invocation. Use
 the Run graph to return to the broader parent-and-child view.

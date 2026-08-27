@@ -51,30 +51,37 @@ The internal Python package is oclp_explorer; CYCLOPS is the UI name.
 - Artifact node labels use their own logical IDs. Their input/output-port
   associations remain available in graph data without replacing identity in the
   rendered label.
-- CYCLOPS fits the viewport when it loads a different graph scope, not when a
-  user selects a node, opens record detail, changes its selection styling, or
-  expands an ArtifactSet. Navigation therefore keeps the view the user chose.
+- CYCLOPS fits the viewport when it loads a different graph scope or expands
+  or collapses a collection. Selecting a node or opening its record detail
+  keeps the view the user chose.
+- **Export GIF** captures the current visible graph as a short looping GIF.
+  It preserves the current viewport, graph scope, collection expansion, and
+  theme; animated Data DAG edges flow while provenance edges remain static.
+  The browser creates and downloads the GIF locally. Because CYCLOPS is
+  read-only, the action never writes an OCLP record or changes the store.
 - Artifact nodes are rounded capsules and Invocation nodes are hexagons. The
   shapes communicate their roles without repeating record-kind text in labels.
-- ArtifactSets that an Invocation binds directly in its `outputs` are part of
-  that computation's graph. For legacy records that lack that binding,
+- An ArtifactSet bound directly as an Invocation input or output is part of
+  that computation's graph. For legacy output records that lack that binding,
   CYCLOPS falls back to a member/output intersection. The fallback is
   necessarily ambiguous when independent runs publish identical
   content-addressed members, so producers should publish the set itself on a
-  named output port. When the visible members belong to only one visible set,
-  CYCLOPS renders that ArtifactSet as a containing box rather than separate
-  membership arrows. An Artifact with overlapping set membership remains
-  outside the boxes with its explicit containment links, while each set's
-  unshared members stay grouped. Expanding a set adds any additional named
-  members.
-- A direct **dataset-snapshot** profile Artifact input is rendered as a green
-  container around the exact partition Artifacts declared in its canonical
-  payload. This is profile-aware OCLP behavior, not domain-specific inference:
-  CYCLOPS reads only integrity-verified dataset-snapshot payloads stored in the
+  named port. Collections start collapsed. A collapsed collection has layered
+  backplates, a member count, and an expand chevron so it is visibly distinct
+  from an ordinary Artifact. Double-click the collection node,
+  or use **Expand members** in its record inspector, to reveal its exact
+  member Artifacts inside the containing box; repeat the action to collapse
+  them. The direct ArtifactSet-to-Invocation binding remains the Data DAG
+  edge. Member visibility is a `contains` overlay, never a fan-out of
+  independent input or output edges. An Artifact with overlapping set
+  membership remains outside the boxes with its explicit containment links.
+- A direct **dataset-snapshot** profile Artifact input is a collection too. It
+  starts collapsed and expands by the same double-click or inspector control
+  to show the exact partition Artifacts declared in its canonical payload.
+  This is profile-aware OCLP behavior, not domain-specific inference: CYCLOPS
+  reads only integrity-verified dataset-snapshot payloads stored in the
   configured local OCLP store. The snapshot-to-Invocation edge remains the
-  direct data binding; partition membership is a contextual overlay. Selecting
-  a dataset or ArtifactSet highlights only its container and never hides or
-  intercepts its member nodes.
+  direct data binding; partition membership is a contextual overlay.
 - An **OCLP Provenance** overlay scoped to the selected Invocation: it keeps
   that Data DAG's Artifact and Invocation nodes in place, then adds Definition,
   implementation source metadata, Evidence, Events, and other non-dataflow

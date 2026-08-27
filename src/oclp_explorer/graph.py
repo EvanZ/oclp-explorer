@@ -810,7 +810,7 @@ def _validate_project_records(records: dict[str, Any]) -> None:
             for reference in references:
                 input_digest = require(
                     reference,
-                    kind="artifact",
+                    kind=("artifact", "artifact_set"),
                     label=f"Invocation {record.id} input {port!r}",
                 )
                 derivation.setdefault(input_digest, set()).add(digest)

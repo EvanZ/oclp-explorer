@@ -217,6 +217,71 @@ def test_project_graph_traverses_core_bindings_without_domain_imports(tmp_path: 
     assert invocation.digest.value in {node["id"] for node in focused["nodes"]}
 
 
+def test_project_graph_accepts_an_artifact_set_invocation_input(tmp_path: Path) -> None:
+    root = tmp_path / "oclp"
+    source = _publish(
+        root,
+        Artifact(
+            id="urn:example:artifact:model-weights",
+            name="Model weights",
+            media_type="application/octet-stream",
+            digest=Digest(value="c" * 64),
+            size=1,
+        ),
+    )
+    model_package = _publish(
+        root,
+        ArtifactSet(
+            id="urn:example:artifact-set:model-package",
+            name="Model package",
+            members=(ArtifactSetMember(name="weights", artifact=source),),
+        ),
+    )
+    definition = _publish(
+        root,
+        ComputationDefinition(
+            id="urn:example:definition:evaluate-model",
+            implementation=Implementation(
+                kind="other",
+                locator="example:evaluate-model",
+                source={"kind": "opaque", "reason": "test fixture"},
+            ),
+        ),
+    )
+    response = _publish(
+        root,
+        Artifact(
+            id="urn:example:artifact:prediction",
+            name="Prediction response",
+            media_type="application/json",
+            digest=Digest(value="d" * 64),
+            size=1,
+        ),
+    )
+    invocation = _publish(
+        root,
+        Invocation(
+            id="urn:example:invocation:evaluate-model",
+            definition=definition,
+            inputs={"model_package": (model_package,)},
+            outputs={"response": (response,)},
+        ),
+    )
+
+    graph = load_project_graph(root)
+
+    assert {
+        (edge["source"], edge["target"], edge["relation"])
+        for edge in graph.derivation_edges
+    } == {
+        (model_package.digest.value, invocation.digest.value, "consumes"),
+        (invocation.digest.value, response.digest.value, "produces"),
+    }
+    assert model_package.digest.value in {
+        node["id"] for node in graph.graph_payload()["nodes"]
+    }
+
+
 def test_dataset_snapshot_input_groups_exact_partition_artifacts(tmp_path: Path) -> None:
     root = tmp_path / "oclp"
     first_part = _publish(

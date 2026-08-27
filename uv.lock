@@ -277,7 +277,7 @@ wheels = [
 [[package]]
 name = "oclp"
 version = "0.1.0a0"
-source = { git = "https://github.com/EvanZ/oclp-python.git?rev=66d294b913433396d25d61a18c504ff43c1df4b3#66d294b913433396d25d61a18c504ff43c1df4b3" }
+source = { git = "https://github.com/EvanZ/oclp-python.git?rev=b00d4f4#b00d4f4fbf2797861fe992e509f3bc63da099d7b" }
 dependencies = [
     { name = "pydantic" },
     { name = "rfc8785" },
@@ -311,7 +311,7 @@ docs = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.140.7" },
-    { name = "oclp", extras = ["duckdb"], git = "https://github.com/EvanZ/oclp-python.git?rev=66d294b913433396d25d61a18c504ff43c1df4b3" },
+    { name = "oclp", extras = ["duckdb"], git = "https://github.com/EvanZ/oclp-python.git?rev=b00d4f4" },
     { name = "uvicorn", specifier = ">=0.51.0" },
 ]
 

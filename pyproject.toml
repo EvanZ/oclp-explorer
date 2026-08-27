@@ -10,7 +10,7 @@ authors = [
 ]
 dependencies = [
   "fastapi>=0.140.7",
-  "oclp[duckdb] @ git+https://github.com/EvanZ/oclp-python.git@66d294b913433396d25d61a18c504ff43c1df4b3",
+  "oclp[duckdb] @ git+https://github.com/EvanZ/oclp-python.git@b00d4f4",
   "uvicorn>=0.51.0",
 ]
 

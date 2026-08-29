@@ -112,7 +112,7 @@ def create_app(
 
     @app.get("/api/runs")
     def runs() -> dict[str, object]:
-        """List root Invocation runs for the run-oriented CYCLOPS selector."""
+        """List root runs and their connected lineage groups for navigation."""
 
         graph()
         with catalog_lock:
@@ -122,7 +122,7 @@ def create_app(
     @app.get("/api/graph")
     def project_graph(
         view: str = Query(
-            default="derivation", pattern="^(run|derivation|provenance|reference)$"
+            default="derivation", pattern="^(run|derivation|provenance|timeline|reference)$"
         ),
         component: str | None = None,
         run: str | None = None,
@@ -149,7 +149,7 @@ def create_app(
         digest: str,
         depth: int = Query(default=2, ge=0, le=6),
         view: str = Query(
-            default="derivation", pattern="^(run|derivation|provenance|reference)$"
+            default="derivation", pattern="^(run|derivation|provenance|timeline|reference)$"
         ),
         component: str | None = None,
         run: str | None = None,

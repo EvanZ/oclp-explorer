@@ -4,8 +4,16 @@ export type GraphNode = {
   record_id: string;
   label: string;
   digest: string;
-  layer?: "data" | "provenance";
+  layer?: "data" | "provenance" | "timeline";
   collection_kind?: "dataset-snapshot";
+  /** Read-only presentation metadata derived from Core chronology fields. */
+  timeline_at?: string;
+  timeline_sequence?: string;
+  timeline_end_at?: string;
+  timeline_lane?: string;
+  timeline_depth?: string;
+  /** Presentation role for a direct Timeline data binding. */
+  timeline_role?: "input" | "output";
 };
 
 export type GraphEdge = {
@@ -17,7 +25,7 @@ export type GraphEdge = {
 };
 
 export type GraphPayload = {
-  view: "run" | "derivation" | "provenance" | "reference";
+  view: "run" | "derivation" | "provenance" | "timeline" | "reference";
   nodes: GraphNode[];
   edges: GraphEdge[];
   collection_edges: GraphEdge[];
@@ -73,8 +81,19 @@ export type Run = {
   invocations: RunInvocation[];
 };
 
+export type RunLineage = {
+  id: string;
+  label: string;
+  root_count: number;
+  invocation_count: number;
+  artifact_count: number;
+  status_counts: Record<string, number>;
+  runs: Run[];
+};
+
 export type RunsPayload = {
   runs: Run[];
+  lineages: RunLineage[];
 };
 
 export type Summary = {

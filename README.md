@@ -5,7 +5,8 @@ Cyclops is a read-only local web application for exploring durable
 records.
 
 It reads a configured OCLP record store, builds a rebuildable local DuckDB
-read model, and presents run-oriented derivation and provenance graphs. It
+read model, and presents run lineage, strict Data DAG, chronological timeline,
+and record-level provenance context. It
 does not create, mutate, or reinterpret protocol records, and it contains no
 application-domain logic.
 
@@ -31,6 +32,19 @@ npm run dev
 
 Open <http://127.0.0.1:5175>. The development server proxies API requests to
 the local backend on port 8002.
+
+For the NBA dogfood store, one command safely restarts both local services:
+
+```bash
+bash scripts/restart-local.sh
+```
+
+It expects the store at
+`/Users/evanzamir/projects/nba-lineup-model-oclp/data/oclp`. Set
+`OCLP_DOGFOOD_DIR` to use another local OCLP store, and
+`OCLP_PYTHON_SOURCE` to use a compatible local `oclp-python/src` checkout.
+The script refuses to stop an unrelated process that happens to be listening
+on either Cyclops port.
 
 ## Development
 

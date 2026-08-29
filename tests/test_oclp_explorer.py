@@ -71,6 +71,7 @@ def test_project_graph_traverses_core_bindings_without_domain_imports(tmp_path: 
             media_type="text/plain",
             digest=Digest(value="b" * 64),
             size=1,
+            created_at=datetime(2026, 8, 22, tzinfo=UTC),
         ),
     )
     release = _publish(
@@ -79,6 +80,7 @@ def test_project_graph_traverses_core_bindings_without_domain_imports(tmp_path: 
             id="urn:example:artifact-set:release",
             name="Release",
             members=(ArtifactSetMember(name="result", artifact=output),),
+            created_at=datetime(2026, 8, 22, tzinfo=UTC),
         ),
     )
     invocation = _publish(
@@ -91,19 +93,7 @@ def test_project_graph_traverses_core_bindings_without_domain_imports(tmp_path: 
             outputs={"result": (output,), "release": (release,)},
         ),
     )
-    _publish(
-        root,
-        LifecycleEvent(
-            id="urn:example:event:outputs",
-            name="Outputs published",
-            invocation=invocation,
-            event_type="outputs-published",
-            occurred_at=datetime(2026, 8, 22, tzinfo=UTC),
-            sequence=0,
-            data={"outputs": {"result": output.model_dump(mode="json")}},
-        ),
-    )
-    _publish(
+    evidence = _publish(
         root,
         Evidence(
             id="urn:example:evidence:output",
@@ -112,6 +102,21 @@ def test_project_graph_traverses_core_bindings_without_domain_imports(tmp_path: 
             contract={"id": "urn:example:contract:output", "version": "1"},
             outcome="pass",
             observed_at=datetime(2026, 8, 22, tzinfo=UTC),
+        ),
+    )
+    event = _publish(
+        root,
+        LifecycleEvent(
+            id="urn:example:event:outputs",
+            name="Outputs published",
+            invocation=invocation,
+            event_type="outputs-published",
+            occurred_at=datetime(2026, 8, 22, tzinfo=UTC),
+            sequence=0,
+            data={
+                "outputs": {"result": output.model_dump(mode="json")},
+                "evidence": evidence.model_dump(mode="json"),
+            },
         ),
     )
     input_bundle = _publish(
@@ -193,6 +198,10 @@ def test_project_graph_traverses_core_bindings_without_domain_imports(tmp_path: 
     assert provenance_nodes[source.digest.value]["layer"] == "data"
     assert provenance_nodes[definition.digest.value]["layer"] == "provenance"
     assert provenance_nodes[definition.digest.value]["label"] == "definition\nTransform"
+    assert provenance_nodes[event.digest.value]["timeline_at"] == "2026-08-22T00:00:00+00:00"
+    assert provenance_nodes[event.digest.value]["timeline_sequence"] == "0"
+    assert provenance_nodes[evidence.digest.value]["timeline_at"] == "2026-08-22T00:00:00+00:00"
+    assert provenance_nodes[evidence.digest.value]["timeline_sequence"] == "0.5"
     assert {edge["relation"] for edge in provenance["edges"]} == {
         "consumes",
         "definition",
@@ -206,6 +215,23 @@ def test_project_graph_traverses_core_bindings_without_domain_imports(tmp_path: 
         "output",
         "contains",
         "event-reference",
+    }
+    timeline_nodes = {
+        node["id"]: node for node in graph.graph_payload(view="timeline")["nodes"]
+    }
+    assert timeline_nodes[evidence.digest.value]["timeline_sequence"] == "0.5"
+    assert timeline_nodes[output.digest.value]["timeline_at"] == "2026-08-22T00:00:00+00:00"
+    assert timeline_nodes[release.digest.value]["timeline_at"] == "2026-08-22T00:00:00+00:00"
+    assert timeline_nodes[source.digest.value]["timeline_role"] == "input"
+    assert "timeline_at" not in timeline_nodes[source.digest.value]
+    timeline_edges = graph.graph_payload(view="timeline")["edges"]
+    assert {
+        (edge["source"], edge["target"], edge["relation"])
+        for edge in timeline_edges
+    } == {
+        (source.digest.value, invocation.digest.value, "consumes"),
+        (invocation.digest.value, output.digest.value, "produces"),
+        (invocation.digest.value, release.digest.value, "produces"),
     }
     computations = graph.computations_payload()["computations"]
     assert len(computations) == 1
@@ -412,7 +438,7 @@ def test_provenance_view_connects_parent_and_child_invocations(tmp_path: Path) -
             profiles={"lifecycle": {"version": "0.1.0-draft"}},
         ),
     )
-    _publish(
+    parent_requested = _publish(
         root,
         LifecycleEvent(
             id="urn:example:event:season-requested",
@@ -423,7 +449,7 @@ def test_provenance_view_connects_parent_and_child_invocations(tmp_path: Path) -
             data={"run_id": "season-2026-08-23"},
         ),
     )
-    _publish(
+    child_requested = _publish(
         root,
         LifecycleEvent(
             id="urn:example:event:game-requested",
@@ -433,7 +459,7 @@ def test_provenance_view_connects_parent_and_child_invocations(tmp_path: Path) -
             sequence=0,
         ),
     )
-    _publish(
+    child_started = _publish(
         root,
         LifecycleEvent(
             id="urn:example:event:game-started",
@@ -444,7 +470,7 @@ def test_provenance_view_connects_parent_and_child_invocations(tmp_path: Path) -
             attempt_id="game-attempt-1",
         ),
     )
-    _publish(
+    child_failed = _publish(
         root,
         LifecycleEvent(
             id="urn:example:event:game-failed",
@@ -460,7 +486,7 @@ def test_provenance_view_connects_parent_and_child_invocations(tmp_path: Path) -
             ),
         ),
     )
-    _publish(
+    evidence = _publish(
         root,
         Evidence(
             id="urn:example:evidence:game-failed",
@@ -524,6 +550,9 @@ def test_provenance_view_connects_parent_and_child_invocations(tmp_path: Path) -
         }
     with TestClient(create_app(root)) as client:
         assert client.get("/api/runs").json()["runs"] == runs
+        assert client.get(
+            f"/api/graph?view=timeline&run={parent.digest.value}"
+        ).json()["view"] == "timeline"
         assert client.get("/api/health").json()["run_index"] == {
             "run_count": 1,
             "run_member_count": 2,
@@ -549,6 +578,26 @@ def test_provenance_view_connects_parent_and_child_invocations(tmp_path: Path) -
         invocation=child.digest.value,
     )
     assert parent.digest.value not in {node["id"] for node in child_provenance["nodes"]}
+    timeline = graph.graph_payload(view="timeline", run=parent.digest.value)
+    timeline_nodes = {node["id"]: node for node in timeline["nodes"]}
+    assert set(timeline_nodes) == {
+        parent.digest.value,
+        child.digest.value,
+        parent_requested.digest.value,
+        child_requested.digest.value,
+        child_started.digest.value,
+        child_failed.digest.value,
+        evidence.digest.value,
+    }
+    assert timeline_nodes[parent.digest.value]["timeline_lane"] == parent.digest.value
+    assert timeline_nodes[parent.digest.value]["timeline_depth"] == "0"
+    assert timeline_nodes[child.digest.value]["timeline_lane"] == child.digest.value
+    assert timeline_nodes[child_requested.digest.value]["timeline_lane"] == child.digest.value
+    assert timeline_nodes[child_started.digest.value]["timeline_sequence"] == "1"
+    assert timeline_nodes[evidence.digest.value]["timeline_at"] == "2026-08-23T01:00:00+00:00"
+    assert {(edge["source"], edge["target"], edge["relation"]) for edge in timeline["edges"]} == {
+        (parent.digest.value, child.digest.value, "orchestrates")
+    }
     parent_component = next(
         component_id
         for component_id, node_ids in graph._components().items()
@@ -562,6 +611,119 @@ def test_provenance_view_connects_parent_and_child_invocations(tmp_path: Path) -
     }
     assert {(edge["source"], edge["target"], edge["relation"]) for edge in provenance["edges"]} >= {
         (parent.digest.value, child.digest.value, "orchestrates")
+    }
+
+
+def test_run_lineage_follows_a_produced_candidate_across_retry_roots(tmp_path: Path) -> None:
+    root = tmp_path / "oclp"
+    definition = _publish(
+        root,
+        ComputationDefinition(
+            id="urn:example:definition:model-lifecycle",
+            implementation=Implementation(
+                kind="other",
+                locator="example:model-lifecycle",
+                source={"kind": "opaque", "reason": "test fixture"},
+            ),
+        ),
+    )
+    candidate_member = _publish(
+        root,
+        Artifact(
+            id="urn:example:artifact:candidate-model:metadata",
+            name="Candidate model metadata",
+            media_type="application/json",
+            digest=Digest(value="c" * 64),
+            size=1,
+        ),
+    )
+    candidate = _publish(
+        root,
+        ArtifactSet(
+            id="urn:example:artifact-set:candidate-model",
+            name="Candidate model",
+            members=(ArtifactSetMember(name="metadata.json", artifact=candidate_member),),
+        ),
+    )
+    original_root = _publish(
+        root,
+        Invocation(
+            id="urn:example:invocation:model-lifecycle:original",
+            definition=definition,
+        ),
+    )
+    train = _publish(
+        root,
+        Invocation(
+            id="urn:example:invocation:train-candidate:original",
+            definition=definition,
+            parent_invocation=RecordReference(id=original_root.id),
+            outputs={"candidate_model": (candidate,)},
+        ),
+    )
+    failed_backtest = _publish(
+        root,
+        Invocation(
+            id="urn:example:invocation:frozen-backtest:original",
+            definition=definition,
+            parent_invocation=RecordReference(id=original_root.id),
+            inputs={"candidate_model": (candidate,)},
+        ),
+    )
+    retry_root = _publish(
+        root,
+        Invocation(
+            id="urn:example:invocation:model-lifecycle:retry",
+            definition=definition,
+            inputs={"candidate_model": (candidate,)},
+        ),
+    )
+    retry_gate = _publish(
+        root,
+        Invocation(
+            id="urn:example:invocation:model-eligibility-gate:retry",
+            definition=definition,
+            parent_invocation=RecordReference(id=retry_root.id),
+            inputs={"candidate_model": (candidate,)},
+        ),
+    )
+
+    graph = load_project_graph(root)
+    lineage = graph.graph_payload(view="run", run=retry_root.digest.value)
+    lineage_node_ids = {node["id"] for node in lineage["nodes"]}
+
+    assert lineage_node_ids == {
+        original_root.digest.value,
+        train.digest.value,
+        failed_backtest.digest.value,
+        candidate.digest.value,
+        retry_root.digest.value,
+        retry_gate.digest.value,
+    }
+    assert {
+        (edge["source"], edge["target"], edge["relation"])
+        for edge in lineage["edges"]
+    } >= {
+        (original_root.digest.value, train.digest.value, "orchestrates"),
+        (original_root.digest.value, failed_backtest.digest.value, "orchestrates"),
+        (train.digest.value, candidate.digest.value, "produces"),
+        (candidate.digest.value, retry_root.digest.value, "consumes"),
+        (retry_root.digest.value, retry_gate.digest.value, "orchestrates"),
+    }
+
+    data_dag = graph.graph_payload(view="derivation", run=retry_root.digest.value)
+    assert {node["id"] for node in data_dag["nodes"]} == lineage_node_ids
+    assert {edge["relation"] for edge in data_dag["edges"]} == {"consumes", "produces"}
+
+    with CyclopsRunIndex(tmp_path / "cyclops.duckdb") as run_index:
+        run_index.rebuild(graph)
+        lineages = run_index.runs_payload()["lineages"]
+
+    assert len(lineages) == 1
+    assert lineages[0]["root_count"] == 2
+    assert {run["id"] for run in lineages[0]["runs"]} == {
+        original_root.digest.value,
+        retry_root.digest.value,
     }
 
 

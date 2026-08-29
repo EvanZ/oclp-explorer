@@ -199,6 +199,21 @@ class OclpProjectGraph:
             )
         return {"runs": runs}
 
+    def run_lineage_roots(self, root_digest: str) -> tuple[str, ...]:
+        """Return every explicit run root in ``root_digest``'s lineage.
+
+        This is an explorer projection over the existing producer/consumer
+        bindings.  It lets navigation present one lineage as a group while
+        preserving each root Invocation's own identity and child hierarchy.
+        """
+
+        invocation_digests = set(self._run_lineage_invocation_depths(root_digest))
+        return tuple(
+            root
+            for root in self._run_roots()
+            if root in invocation_digests
+        )
+
     def graph_payload(
         self,
         *,
@@ -207,7 +222,7 @@ class OclpProjectGraph:
         run: str | None = None,
         invocation: str | None = None,
     ) -> dict[str, object]:
-        """Return a run, focused Data DAG, provenance overlay, or Core references."""
+        """Return run lineage, Data DAG, provenance context, timeline, or references."""
 
         nodes, edges = self._view(
             view,
@@ -355,6 +370,8 @@ class OclpProjectGraph:
                 run=run,
                 invocation=invocation,
             )
+        if view == "timeline":
+            return self._timeline_view(run)
         if view == "reference":
             node_ids = self._component_node_ids(component)
             if component is None:
@@ -396,6 +413,127 @@ class OclpProjectGraph:
                 derivation_edges,
             )
         raise ValueError(f"Unknown graph view: {view}")
+
+    def _timeline_view(
+        self,
+        run: str | None,
+    ) -> tuple[tuple[dict[str, str], ...], tuple[dict[str, str], ...]]:
+        """Project connected run lineage chronology onto a time axis.
+
+        Direct inputs and outputs remain visible as Data DAG bindings. Records
+        with an asserted Core ``created_at`` sit at their own time; inputs
+        without that timestamp are explicitly marked untimed so the client can
+        place them before the chronology without inventing a date.
+        """
+
+        root_digest = self._resolve_run(run)
+        invocation_depths = self._run_lineage_invocation_depths(root_digest)
+        invocation_ids = set(invocation_depths)
+        evidence_sequence_tiebreakers = _evidence_sequence_tiebreakers(
+            self.records,
+            self.reference_edges,
+        )
+        timeline_owner: dict[str, str] = {}
+        timeline_roles: dict[str, str] = {}
+        timeline_node_ids = set(invocation_ids)
+        for edge in self.reference_edges:
+            if (
+                edge["relation"] in {"event-invocation", "evidence-subject"}
+                and edge["target"] in invocation_ids
+            ):
+                timeline_node_ids.add(edge["source"])
+                timeline_owner[edge["source"]] = edge["target"]
+        for edge in self.derivation_edges:
+            if edge["relation"] == "consumes" and edge["target"] in invocation_ids:
+                input_artifact = self.records[edge["source"]]
+                if input_artifact.kind not in {"artifact", "artifact_set"}:
+                    continue
+                timeline_node_ids.add(edge["source"])
+                timeline_owner[edge["source"]] = edge["target"]
+                timeline_roles[edge["source"]] = "input"
+            elif edge["relation"] == "produces" and edge["source"] in invocation_ids:
+                output = self.records[edge["target"]]
+                if output.kind not in {"artifact", "artifact_set"}:
+                    continue
+                timeline_node_ids.add(edge["target"])
+                timeline_owner[edge["target"]] = edge["source"]
+                timeline_roles[edge["target"]] = "output"
+
+        nodes: list[dict[str, str]] = []
+        for node in self.nodes:
+            digest = node["id"]
+            if digest not in timeline_node_ids:
+                continue
+            record = self.records[digest]
+            if record.kind == "invocation":
+                summary = self.invocation_summaries[digest].timeline
+                timeline_at = _timestamp(summary.ordering_at)
+                timeline_end_at = _timestamp(summary.completed_at or summary.last_event_at)
+                nodes.append(
+                    {
+                        **node,
+                        "layer": "timeline",
+                        "timeline_lane": digest,
+                        "timeline_depth": str(invocation_depths[digest]),
+                        **({"timeline_at": timeline_at} if timeline_at is not None else {}),
+                        **(
+                            {"timeline_end_at": timeline_end_at}
+                            if timeline_end_at is not None
+                            else {}
+                        ),
+                    }
+                )
+                continue
+            owner = timeline_owner.get(digest)
+            if owner is not None:
+                nodes.append(
+                    {
+                        **node,
+                        "layer": "timeline",
+                        "timeline_lane": owner,
+                        "timeline_depth": str(invocation_depths[owner]),
+                        **(
+                            {"timeline_role": timeline_roles[digest]}
+                            if digest in timeline_roles
+                            else {}
+                        ),
+                        **(
+                            {"timeline_sequence": evidence_sequence_tiebreakers[digest]}
+                            if digest in evidence_sequence_tiebreakers
+                            else {}
+                        ),
+                    }
+                )
+
+        return (
+            tuple(nodes),
+            tuple(
+                sorted(
+                    (
+                        *(
+                            edge
+                            for edge in self.reference_edges
+                            if edge["relation"] == "orchestrates"
+                            and edge["source"] in invocation_ids
+                            and edge["target"] in invocation_ids
+                        ),
+                        *(
+                            edge
+                            for edge in self.derivation_edges
+                            if edge["relation"] in {"consumes", "produces"}
+                            and (
+                                edge["target"] in invocation_ids
+                                if edge["relation"] == "consumes"
+                                else edge["source"] in invocation_ids
+                            )
+                            and edge["source"] in timeline_node_ids
+                            and edge["target"] in timeline_node_ids
+                        ),
+                    ),
+                    key=lambda edge: (edge["relation"], edge["id"]),
+                )
+            ),
+        )
 
     def _provenance_view(
         self,
@@ -472,10 +610,19 @@ class OclpProjectGraph:
             and edge["target"] in context_node_ids
             and edge["relation"] not in {"input", "output", "contains", "event-reference"}
         )
+        evidence_sequence_tiebreakers = _evidence_sequence_tiebreakers(
+            self.records,
+            self.reference_edges,
+        )
         nodes = tuple(
             {
                 **node,
                 "layer": "data" if node["id"] in data_node_ids else "provenance",
+                **(
+                    {"timeline_sequence": evidence_sequence_tiebreakers[node["id"]]}
+                    if node["id"] in evidence_sequence_tiebreakers
+                    else {}
+                ),
             }
             for node in self.nodes
             if node["id"] in context_node_ids
@@ -490,10 +637,18 @@ class OclpProjectGraph:
     def _run_view(
         self, run: str | None
     ) -> tuple[tuple[dict[str, str], ...], tuple[dict[str, str], ...]]:
-        """Show a root Invocation, its child work, and direct data bindings."""
+        """Show all connected execution roots, child work, and data bindings.
+
+        A root's explicit ``parent_invocation`` hierarchy describes the work it
+        orchestrated. Artifact producer/consumer bindings can connect it to a
+        previous or retry root. This run-lineage projection follows only those
+        explicit data bridges, then includes the complete hierarchy for every
+        connected root. It is intentionally not labeled a DAG because it also
+        renders orchestration edges.
+        """
 
         root_digest = self._resolve_run(run)
-        data_node_ids = self._run_data_node_ids(root_digest)
+        data_node_ids = self._run_lineage_data_node_ids(root_digest)
         edges = tuple(
             edge
             for edge in (*self.derivation_edges, *self.reference_edges)
@@ -545,13 +700,13 @@ class OclpProjectGraph:
         if invocation is not None:
             if invocation not in self.records or self.records[invocation].kind != "invocation":
                 raise ValueError(f"Unknown invocation: {invocation}")
-            if run is not None and invocation not in self._run_invocation_depths(
+            if run is not None and invocation not in self._run_lineage_invocation_depths(
                 self._resolve_run(run)
             ):
                 raise ValueError(f"Invocation {invocation} is not part of run {run}")
             return self._invocation_data_node_ids({invocation})
         if run is not None:
-            return self._run_data_node_ids(self._resolve_run(run))
+            return self._run_lineage_data_node_ids(self._resolve_run(run))
         return self._component_node_ids(component)
 
     def _run_roots(self) -> tuple[str, ...]:
@@ -604,6 +759,73 @@ class OclpProjectGraph:
 
     def _run_data_node_ids(self, root_digest: str) -> set[str]:
         return self._invocation_data_node_ids(set(self._run_invocation_depths(root_digest)))
+
+    def _run_lineage_data_node_ids(self, root_digest: str) -> set[str]:
+        """Return direct data bindings for all Invocation roots in one lineage."""
+
+        return self._invocation_data_node_ids(
+            set(self._run_lineage_invocation_depths(root_digest))
+        )
+
+    def _run_lineage_invocation_depths(self, root_digest: str) -> dict[str, int]:
+        """Return complete explicit runs connected by producer/consumer bindings.
+
+        This deliberately does *not* treat shared, unproduced inputs as a
+        connection. Crossing a run boundary requires an Artifact or
+        ArtifactSet that one Invocation explicitly produced and another
+        explicitly consumed. That includes retry and handoff workflows while
+        avoiding a project-wide graph merely because jobs read the same lake.
+        """
+
+        root_digests = {root_digest}
+        changed = True
+        while changed:
+            changed = False
+            invocation_digests = {
+                invocation_digest
+                for root in root_digests
+                for invocation_digest in self._run_invocation_depths(root)
+            }
+            produced_by_artifact: dict[str, set[str]] = {}
+            consumed_by_artifact: dict[str, set[str]] = {}
+            for edge in self.derivation_edges:
+                if edge["relation"] == "produces":
+                    produced_by_artifact.setdefault(edge["target"], set()).add(edge["source"])
+                elif edge["relation"] == "consumes":
+                    consumed_by_artifact.setdefault(edge["source"], set()).add(edge["target"])
+            for artifact_digest, producers in produced_by_artifact.items():
+                consumers = consumed_by_artifact.get(artifact_digest, set())
+                bridge_invocations = (
+                    producers | consumers
+                    if producers & invocation_digests or consumers & invocation_digests
+                    else set()
+                )
+                for invocation_digest in bridge_invocations:
+                    root = self._run_root(invocation_digest)
+                    if root not in root_digests:
+                        root_digests.add(root)
+                        changed = True
+
+        depths: dict[str, int] = {}
+        for root in sorted(root_digests):
+            for invocation_digest, depth in self._run_invocation_depths(root).items():
+                # Keep the selected root's hierarchy first in a timeline lane
+                # tie; other roots retain their own hierarchy depth.
+                depths[invocation_digest] = depth
+        return depths
+
+    def _run_root(self, invocation_digest: str) -> str:
+        """Resolve one Invocation to its explicit orchestration root."""
+
+        parents = {
+            edge["target"]: edge["source"]
+            for edge in self.reference_edges
+            if edge["relation"] == "orchestrates"
+        }
+        root = invocation_digest
+        while root in parents:
+            root = parents[root]
+        return root
 
     def _invocation_data_node_ids(self, invocation_digests: set[str]) -> set[str]:
         """Return direct input/output Artifacts for the selected Invocations."""
@@ -859,13 +1081,47 @@ def _node(
     digest: str,
     record: Any,
 ) -> dict[str, str]:
-    return {
+    node = {
         "id": digest,
         "kind": record.kind,
         "record_id": record.id,
         "label": _node_label(record),
         "digest": f"sha256:{digest}",
     }
+    if record.kind == "event":
+        node["timeline_at"] = _timestamp(record.occurred_at)
+        node["timeline_sequence"] = str(record.sequence)
+    elif record.kind == "evidence":
+        node["timeline_at"] = _timestamp(record.observed_at)
+    elif record.kind in {"artifact", "artifact_set"} and record.created_at is not None:
+        node["timeline_at"] = _timestamp(record.created_at)
+    return node
+
+
+def _evidence_sequence_tiebreakers(
+    records: dict[str, Any],
+    reference_edges: Iterable[dict[str, str]],
+) -> dict[str, str]:
+    """Place same-time Evidence just after an Event that directly names it."""
+
+    tiebreakers: dict[str, str] = {}
+    for edge in reference_edges:
+        if edge["relation"] != "event-reference":
+            continue
+        event = records[edge["source"]]
+        evidence = records[edge["target"]]
+        if event.kind != "event" or evidence.kind != "evidence":
+            continue
+        if _timestamp(event.occurred_at) != _timestamp(evidence.observed_at):
+            continue
+        # A direct Event reference establishes a causal tie without inventing
+        # a visible dataflow edge. Place Evidence after the Event when their
+        # immutable timestamps are equal.
+        sequence = float(event.sequence) + 0.5
+        current = tiebreakers.get(edge["target"])
+        if current is None or sequence > float(current):
+            tiebreakers[edge["target"]] = f"{sequence:g}"
+    return tiebreakers
 
 
 def _invocation_summaries(records: dict[str, Any]) -> dict[str, _InvocationSummary]:

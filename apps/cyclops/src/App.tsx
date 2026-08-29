@@ -1,18 +1,42 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Background,
+  BaseEdge,
   Controls,
+  getBezierPath,
+  Handle,
   MarkerType,
   MiniMap,
   Position,
   ReactFlow,
+  useInternalNode,
   type Edge,
+  type EdgeProps,
   type Node,
+  type NodeChange,
   type NodeMouseHandler,
+  type NodeProps,
   type ReactFlowInstance,
+  type XYPosition,
 } from "@xyflow/react";
 import { toCanvas } from "html-to-image";
 import { GIFEncoder, applyPalette, quantize } from "gifenc";
+import {
+  Cog,
+  Database,
+  File,
+  FileInput,
+  FileOutput,
+  FileStack,
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
+  ScrollText,
+  ShieldCheck,
+  Zap,
+  type LucideIcon,
+} from "lucide-react";
 
 import type {
   Diagnostic,
@@ -22,6 +46,7 @@ import type {
   RecordPayload,
   Run,
   RunInvocation,
+  RunLineage,
   RunsPayload,
   Summary,
 } from "./types";
@@ -33,6 +58,11 @@ type FilteredRun = {
   invocations: RunInvocation[];
   matchingInvocationCount: number;
 };
+type FilteredLineage = {
+  lineage: RunLineage;
+  runs: FilteredRun[];
+  matchingInvocationCount: number;
+};
 type GraphTheme = {
   canvasBackground: string;
   grid: string;
@@ -42,6 +72,10 @@ type GraphTheme = {
   nodeText: string;
   selection: string;
   referenceEdge: string;
+  trace: {
+    upstream: string;
+    downstream: string;
+  };
   kinds: Record<string, string>;
 };
 
@@ -55,6 +89,10 @@ const GRAPH_THEMES: Record<ThemeName, GraphTheme> = {
     nodeText: "#e5edf5",
     selection: "#b9f3ff",
     referenceEdge: "#718096",
+    trace: {
+      upstream: "#60a5fa",
+      downstream: "#34d399",
+    },
     kinds: {
       artifact: "#6ee7b7",
       artifact_set: "#fbbf24",
@@ -73,6 +111,10 @@ const GRAPH_THEMES: Record<ThemeName, GraphTheme> = {
     nodeText: "#17202b",
     selection: "#0e7490",
     referenceEdge: "#64748b",
+    trace: {
+      upstream: "#2563eb",
+      downstream: "#059669",
+    },
     kinds: {
       artifact: "#057a55",
       artifact_set: "#a16207",
@@ -93,6 +135,173 @@ const RUN_STATUS_FILTERS: Array<{ id: RunStatusFilter; label: string }> = [
 const GIF_FRAME_COUNT = 15;
 const GIF_FRAME_DELAY_MS = 180;
 const GIF_MAX_WIDTH = 1280;
+const TIMELINE_AXIS_LEFT = 120;
+const TIMELINE_UNTIMED_INPUT_OFFSET = 260;
+const TIMELINE_MIN_WIDTH = 920;
+const TIMELINE_MAX_WIDTH = 3_200;
+const TIMELINE_VERTICAL_DRAG_BOUND = 1_000_000;
+const GRAPH_LAYOUT_VERSION = "causal-output-events-v1";
+const TIMELINE_TICK_STEPS_MS = [
+  1_000,
+  5_000,
+  10_000,
+  30_000,
+  60_000,
+  5 * 60_000,
+  15 * 60_000,
+  30 * 60_000,
+  60 * 60_000,
+  3 * 60 * 60_000,
+  6 * 60 * 60_000,
+  12 * 60 * 60_000,
+  24 * 60 * 60_000,
+  2 * 24 * 60 * 60_000,
+  7 * 24 * 60 * 60_000,
+  14 * 24 * 60 * 60_000,
+  30 * 24 * 60 * 60_000,
+];
+
+type TimelineTickData = {
+  label: string;
+  height: number;
+};
+type RecordNodeData = {
+  label: string;
+  kind: string;
+  collectionKind?: "dataset-snapshot";
+  artifactRole?: "input" | "output" | "intermediate";
+};
+type NodePositionsByScope = Record<string, Record<string, XYPosition>>;
+type BaseGraphView = "run" | "derivation" | "timeline";
+
+function TimelineTick({ data }: NodeProps) {
+  const tick = data as TimelineTickData;
+  return (
+    <div className="timeline-tick" style={{ height: tick.height }}>
+      <span>{tick.label}</span>
+    </div>
+  );
+}
+
+function recordIcon(data: RecordNodeData): LucideIcon {
+  if (data.collectionKind === "dataset-snapshot") return Database;
+  switch (data.kind) {
+    case "artifact":
+      return data.artifactRole === "input"
+        ? FileInput
+        : data.artifactRole === "output"
+          ? FileOutput
+          : File;
+    case "artifact_set":
+      return FileStack;
+    case "definition":
+      return ScrollText;
+    case "invocation":
+      return Cog;
+    case "event":
+      return Zap;
+    case "evidence":
+      return ShieldCheck;
+    default:
+      return File;
+  }
+}
+
+function RecordNode({ data }: NodeProps) {
+  const record = data as RecordNodeData;
+  const Icon = recordIcon(record);
+  return (
+    <div className="record-node">
+      <Icon
+        aria-hidden="true"
+        className={
+          "record-node-icon" +
+          (record.kind === "invocation"
+            ? " is-rotating"
+            : record.kind === "event"
+              ? " is-pulsing"
+              : record.kind === "artifact_set"
+                ? " is-compressing"
+              : "")
+        }
+        size={30}
+        strokeWidth={2}
+      />
+      <span className="record-node-label">
+        {record.label.split("\n").map((line, index) => (
+          <span key={index}>{line}</span>
+        ))}
+      </span>
+      <Handle className="record-node-handle" type="target" position={Position.Left} />
+      <Handle className="record-node-handle" type="source" position={Position.Right} />
+    </div>
+  );
+}
+
+const nodeTypes = { record: RecordNode, timelineTick: TimelineTick };
+
+type NodeBounds = {
+  height: number;
+  width: number;
+  x: number;
+  y: number;
+};
+
+function internalNodeBounds(node: ReturnType<typeof useInternalNode>): NodeBounds | null {
+  if (!node) return null;
+  const width = node.measured.width ?? node.width ?? 0;
+  const height = node.measured.height ?? node.height ?? 0;
+  if (width <= 0 || height <= 0) return null;
+  return {
+    x: node.internals.positionAbsolute.x,
+    y: node.internals.positionAbsolute.y,
+    width,
+    height,
+  };
+}
+
+function nearestSide(from: NodeBounds, to: NodeBounds): Position {
+  const horizontalDistance = to.x + to.width / 2 - (from.x + from.width / 2);
+  const verticalDistance = to.y + to.height / 2 - (from.y + from.height / 2);
+  if (Math.abs(horizontalDistance) >= Math.abs(verticalDistance)) {
+    return horizontalDistance >= 0 ? Position.Right : Position.Left;
+  }
+  return verticalDistance >= 0 ? Position.Bottom : Position.Top;
+}
+
+function sidePoint(bounds: NodeBounds, side: Position): XYPosition {
+  switch (side) {
+    case Position.Left:
+      return { x: bounds.x, y: bounds.y + bounds.height / 2 };
+    case Position.Right:
+      return { x: bounds.x + bounds.width, y: bounds.y + bounds.height / 2 };
+    case Position.Top:
+      return { x: bounds.x + bounds.width / 2, y: bounds.y };
+    case Position.Bottom:
+      return { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height };
+  }
+}
+
+function FloatingEdge({ id, source, target, markerEnd, style }: EdgeProps) {
+  const sourceBounds = internalNodeBounds(useInternalNode(source));
+  const targetBounds = internalNodeBounds(useInternalNode(target));
+  if (!sourceBounds || !targetBounds) return null;
+  const sourcePosition = nearestSide(sourceBounds, targetBounds);
+  const targetPosition = nearestSide(targetBounds, sourceBounds);
+  const sourcePoint = sidePoint(sourceBounds, sourcePosition);
+  const targetPoint = sidePoint(targetBounds, targetPosition);
+  const [path] = getBezierPath({
+    sourcePosition,
+    sourceX: sourcePoint.x,
+    sourceY: sourcePoint.y,
+    targetPosition,
+    targetX: targetPoint.x,
+    targetY: targetPoint.y,
+  });
+  return <BaseEdge id={id} markerEnd={markerEnd} path={path} style={style} />;
+}
+
+const edgeTypes = { floating: FloatingEdge };
 
 function waitForAnimationFrame(delayMs: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, delayMs));
@@ -103,10 +312,126 @@ function gifFilename(graph: GraphPayload | null): string {
   return "cyclops-" + (graph?.view ?? "graph") + "-flow-" + timestamp + ".gif";
 }
 
+function timelineTimestamp(node: GraphNode): number | null {
+  const value = node.timeline_at ? Date.parse(node.timeline_at) : Number.NaN;
+  return Number.isNaN(value) ? null : value;
+}
+
+function timelineNodeTimestampLabel(node: GraphNode): string | null {
+  const timestamp = timelineTimestamp(node);
+  if (timestamp === null) return null;
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZone: "UTC",
+    timeZoneName: "short",
+  }).format(new Date(timestamp));
+}
+
+function timelineSequence(node: GraphNode): number {
+  const value = node.timeline_sequence ? Number(node.timeline_sequence) : Number.NaN;
+  return Number.isNaN(value) ? Number.POSITIVE_INFINITY : value;
+}
+
+function timelineTrackKind(node: GraphNode): string {
+  if (node.timeline_role === "input") return "input";
+  if (node.timeline_role === "output") return "output";
+  return node.kind === "artifact" || node.kind === "artifact_set" ? "output" : node.kind;
+}
+
+function definitionInvocationAnchors(
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+): Map<string, GraphNode> {
+  const nodesById = new Map(nodes.map((node) => [node.id, node]));
+  const anchors = new Map<string, GraphNode>();
+  for (const edge of edges) {
+    const source = nodesById.get(edge.source);
+    const target = nodesById.get(edge.target);
+    const definition = source?.kind === "definition"
+      ? source
+      : target?.kind === "definition"
+        ? target
+        : undefined;
+    const invocation = source?.kind === "invocation"
+      ? source
+      : target?.kind === "invocation"
+        ? target
+        : undefined;
+    if (!definition || !invocation) continue;
+    const current = anchors.get(definition.id);
+    const candidateTime = timelineTimestamp(invocation) ?? Number.POSITIVE_INFINITY;
+    const currentTime = current ? timelineTimestamp(current) ?? Number.POSITIVE_INFINITY : Number.POSITIVE_INFINITY;
+    if (
+      !current ||
+      candidateTime < currentTime ||
+      (candidateTime === currentTime && invocation.id.localeCompare(current.id) < 0)
+    ) {
+      anchors.set(definition.id, invocation);
+    }
+  }
+  return anchors;
+}
+
+function eventInvocationAnchors(
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+): Map<string, GraphNode> {
+  const nodesById = new Map(nodes.map((node) => [node.id, node]));
+  const anchors = new Map<string, GraphNode>();
+  for (const edge of edges) {
+    if (edge.relation !== "event-invocation") continue;
+    const source = nodesById.get(edge.source);
+    const target = nodesById.get(edge.target);
+    const event = source?.kind === "event"
+      ? source
+      : target?.kind === "event"
+        ? target
+        : undefined;
+    const invocation = source?.kind === "invocation"
+      ? source
+      : target?.kind === "invocation"
+        ? target
+        : undefined;
+    if (event && invocation) anchors.set(event.id, invocation);
+  }
+  return anchors;
+}
+
+function timelineTickStep(span: number): number {
+  const target = Math.max(1_000, span / 8);
+  return TIMELINE_TICK_STEPS_MS.find((step) => step >= target) ?? TIMELINE_TICK_STEPS_MS.at(-1)!;
+}
+
+function timelineTickLabel(value: number, step: number): string {
+  const date = new Date(value);
+  const dateText = new Intl.DateTimeFormat(undefined, {
+    day: "2-digit",
+    month: "short",
+    timeZone: "UTC",
+    year: step >= 24 * 60 * 60_000 ? "numeric" : undefined,
+  }).format(date);
+  const timeText = new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: step < 60_000 ? "2-digit" : undefined,
+    hour12: false,
+    timeZone: "UTC",
+  }).format(date);
+  return step >= 24 * 60 * 60_000 ? dateText + " UTC" : dateText + " · " + timeText + " UTC";
+}
+
 type GifFlowPulse = {
   color: string;
   lineWidth: number;
   path: Path2D;
+};
+type GifNodeRect = {
+  height: number;
+  width: number;
+  x: number;
+  y: number;
 };
 
 function gifFlowPulses(graphPanel: HTMLDivElement, scale: number): GifFlowPulse[] {
@@ -157,6 +482,47 @@ function drawGifFlowPulses(
     context.stroke(pulse.path);
   }
   context.restore();
+}
+
+function gifNodeRects(
+  graphPanel: HTMLDivElement,
+  scale: number,
+  canvasWidth: number,
+  canvasHeight: number,
+): GifNodeRect[] {
+  const panelBounds = graphPanel.getBoundingClientRect();
+  const inset = Math.ceil(4 * scale);
+  return [...graphPanel.querySelectorAll<HTMLElement>(
+    ".react-flow__node:not(.react-flow__node-timelineTick)",
+  )]
+    .map((node) => {
+      const bounds = node.getBoundingClientRect();
+      const x = Math.max(0, Math.floor((bounds.left - panelBounds.left) * scale) - inset);
+      const y = Math.max(0, Math.floor((bounds.top - panelBounds.top) * scale) - inset);
+      const right = Math.min(
+        canvasWidth,
+        Math.ceil((bounds.right - panelBounds.left) * scale) + inset,
+      );
+      const bottom = Math.min(
+        canvasHeight,
+        Math.ceil((bounds.bottom - panelBounds.top) * scale) + inset,
+      );
+      return { x, y, width: right - x, height: bottom - y };
+    })
+    .filter((rect) => rect.width > 0 && rect.height > 0)
+    // Restore containers before their members so a parent can never cover a
+    // member Artifact when the animated pulse passes underneath the group.
+    .sort((left, right) => right.width * right.height - left.width * left.height);
+}
+
+function restoreGifNodeLayers(
+  context: CanvasRenderingContext2D,
+  baseImage: ImageData,
+  nodeRects: GifNodeRect[],
+): void {
+  for (const rect of nodeRects) {
+    context.putImageData(baseImage, 0, 0, rect.x, rect.y, rect.width, rect.height);
+  }
 }
 
 function statusLabel(status: string | undefined): string {
@@ -336,6 +702,50 @@ function collectionMemberCounts(graph: GraphPayload | null): Map<string, number>
   return counts;
 }
 
+function mergeProvenanceOverlay(
+  graph: GraphPayload | null,
+  provenance: GraphPayload | null,
+): GraphPayload | null {
+  if (!graph || !provenance) return graph;
+  // The provenance endpoint includes the selected Invocation's focused Data
+  // DAG so it can stand alone. When it is an overlay, that data is already
+  // owned by the active primary view. Timeline now renders its direct inputs
+  // itself (at their asserted time or in its explicit untimed column), so
+  // adding overlay bindings would still make the Provenance switch change the
+  // base Data DAG.
+  const provenanceNodes = provenance.nodes.filter((node) => node.layer === "provenance");
+  const provenanceEdges = provenance.edges.filter(
+    (edge) => edge.relation !== "consumes" && edge.relation !== "produces",
+  );
+  const nodes = [...graph.nodes, ...provenanceNodes];
+  const nodeIds = new Set([
+    ...nodes.map((node) => node.id),
+    ...graph.collection_nodes.map((node) => node.id),
+  ]);
+  const uniqueEdges = (edges: GraphEdge[]) =>
+    [...new Map(edges.map((edge) => [edge.id, edge])).values()].filter(
+      (edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target),
+    );
+  return {
+    ...graph,
+    nodes,
+    edges: uniqueEdges([...graph.edges, ...provenanceEdges]),
+    // Collection membership is contextual data navigation, not provenance.
+    // Keep the primary view's collection projection unchanged as well.
+    collection_edges: graph.collection_edges,
+  };
+}
+
+function provenanceTimelineOrder(left: GraphNode, right: GraphNode): number {
+  const timestampDelta =
+    (timelineTimestamp(left) ?? Number.POSITIVE_INFINITY) -
+    (timelineTimestamp(right) ?? Number.POSITIVE_INFINITY);
+  if (timestampDelta !== 0) return timestampDelta;
+  const sequenceDelta = timelineSequence(left) - timelineSequence(right);
+  if (sequenceDelta !== 0) return sequenceDelta;
+  return left.record_id.localeCompare(right.record_id);
+}
+
 function flowNodes(
   graph: GraphPayload | null,
   nodes: GraphNode[],
@@ -345,6 +755,26 @@ function flowNodes(
   collectionPresentation: CollectionPresentation,
 ): Node[] {
   const columnWidth = 310;
+  const visibleNodeIds = new Set(nodes.map((node) => node.id));
+  const artifactBindingRoles = new Map<string, Set<"input" | "output">>();
+  for (const edge of graph?.edges ?? []) {
+    if (!visibleNodeIds.has(edge.source) || !visibleNodeIds.has(edge.target)) continue;
+    if (edge.relation === "consumes") {
+      const roles = artifactBindingRoles.get(edge.source) ?? new Set<"input" | "output">();
+      roles.add("input");
+      artifactBindingRoles.set(edge.source, roles);
+    } else if (edge.relation === "produces") {
+      const roles = artifactBindingRoles.get(edge.target) ?? new Set<"input" | "output">();
+      roles.add("output");
+      artifactBindingRoles.set(edge.target, roles);
+    }
+  }
+  const artifactRoleFor = (node: GraphNode): RecordNodeData["artifactRole"] => {
+    if (node.kind !== "artifact") return undefined;
+    const roles = artifactBindingRoles.get(node.id);
+    if (!roles || roles.size !== 1) return roles?.size ? "intermediate" : undefined;
+    return roles.has("input") ? "input" : "output";
+  };
   const derivationLevels = new Map(nodes.map((node) => [node.id, 0]));
   const usesDataLayout =
     graph?.view === "run" ||
@@ -368,46 +798,95 @@ function flowNodes(
       }
     }
   }
+  const eventAnchors = eventInvocationAnchors(nodes, graph?.edges ?? []);
+  const eventOutputIndex = new Map<string, number>();
+  const eventsByInvocation = new Map<string, GraphNode[]>();
+  for (const event of nodes.filter((node) => node.kind === "event")) {
+    const invocation = eventAnchors.get(event.id);
+    if (!invocation) continue;
+    const events = eventsByInvocation.get(invocation.id) ?? [];
+    events.push(event);
+    eventsByInvocation.set(invocation.id, events);
+  }
+  for (const events of eventsByInvocation.values()) {
+    events.sort(provenanceTimelineOrder).forEach((event, index) => {
+      eventOutputIndex.set(event.id, index);
+    });
+  }
+  const groupedSetNodes = nodes.filter((node) => artifactSets.memberNodesBySet.has(node.id));
+  const groupedSetIds = new Set(groupedSetNodes.map((node) => node.id));
+  const memberNodeIds = new Set(artifactSets.parentSetByArtifact.keys());
+  const dataColumnFor = (node: GraphNode) =>
+    node.kind === "artifact_set" || node.collection_kind === "dataset-snapshot"
+      ? derivationLevels.get(node.id) ?? -1
+      : derivationLevels.get(node.id) ?? 0;
+  // Mirror the primary data-node placement order so an Event can sit beside
+  // its owning Invocation even when it is emitted much later in record order.
+  const dataRowByNode = new Map<string, number>();
+  const nextDataRowByColumn = new Map<number, number>();
+  const topLevelDataNodes = [
+    ...groupedSetNodes,
+    ...nodes.filter((node) => !groupedSetIds.has(node.id) && !memberNodeIds.has(node.id)),
+  ];
+  for (const node of topLevelDataNodes) {
+    if (node.layer === "provenance") continue;
+    const column = dataColumnFor(node);
+    const row = nextDataRowByColumn.get(column) ?? 0;
+    const slots = artifactSets.memberNodesBySet.has(node.id)
+      ? Math.max(
+          1,
+          Math.ceil((58 + (artifactSets.memberNodesBySet.get(node.id)?.length ?? 0) * 70) / 140),
+        )
+      : 1;
+    dataRowByNode.set(node.id, row);
+    nextDataRowByColumn.set(column, row + slots);
+  }
   const byKind = new Map<string, number>();
   const byLevel = new Map<number, number>();
   const provenanceByKind = new Map<string, number>();
-  const eventCount = nodes.filter(
-    (node) => node.layer === "provenance" && node.kind === "event",
-  ).length;
-  const evidenceCount = nodes.filter(
-    (node) => node.layer === "provenance" && node.kind === "evidence",
-  ).length;
+  const provenanceTimeline = nodes
+    .filter(
+      (node) =>
+        node.layer === "provenance" &&
+        (node.kind === "event" || node.kind === "evidence"),
+    )
+    .sort(provenanceTimelineOrder);
+  const provenanceTimelineIndex = new Map(
+    provenanceTimeline.map((node, index) => [node.id, index]),
+  );
 
   const positionFor = (node: GraphNode, slots = 1) => {
     const isSelected = node.id === selectedNodeId;
     const isProvenance = node.layer === "provenance";
+    const eventAnchor = node.kind === "event" ? eventAnchors.get(node.id) : undefined;
     const index = byKind.get(node.kind) ?? 0;
     byKind.set(node.kind, index + 1);
-    const provenanceColumn =
-      node.kind === "artifact" || node.kind === "artifact_set"
+    const provenanceColumn = eventAnchor
+      ? dataColumnFor(eventAnchor) + 1
+      : node.kind === "artifact" || node.kind === "artifact_set"
         ? -1
         : 1;
     const column = usesDataLayout
       ? isProvenance
         ? provenanceColumn
-        : node.kind === "artifact_set" || node.collection_kind === "dataset-snapshot"
-          ? derivationLevels.get(node.id) ?? -1
-          : derivationLevels.get(node.id) ?? 0
+        : dataColumnFor(node)
       : Object.keys(theme.kinds).indexOf(node.kind);
     const provenanceIndex = provenanceByKind.get(node.kind) ?? 0;
     if (isProvenance) provenanceByKind.set(node.kind, provenanceIndex + 1);
     const dataLevelIndex = byLevel.get(column) ?? 0;
     if (!isProvenance) byLevel.set(column, dataLevelIndex + slots);
     const levelIndex = isProvenance
-      ? node.kind === "definition" ||
+      ? eventAnchor
+        ? (dataRowByNode.get(eventAnchor.id) ?? 0) +
+          0.55 +
+          (eventOutputIndex.get(node.id) ?? 0) * 0.6
+        : node.kind === "definition" ||
         node.kind === "artifact" ||
         node.kind === "artifact_set"
         ? -1 - provenanceIndex
-        : node.kind === "event"
-          ? 1 + provenanceIndex
-          : node.kind === "evidence"
-            ? 1 + eventCount + provenanceIndex
-            : 1 + eventCount + evidenceCount + provenanceIndex
+        : node.kind === "event" || node.kind === "evidence"
+          ? 1 + (provenanceTimelineIndex.get(node.id) ?? 0)
+          : 1 + provenanceTimeline.length + provenanceIndex
       : dataLevelIndex;
 
     return {
@@ -430,6 +909,11 @@ function flowNodes(
     const isProvenance = node.layer === "provenance";
     const isCollection = options.collection === true;
     const isCollectionNode = isArtifactCollection(node);
+    const timelineTimestampLabelText =
+      graph?.view === "timeline" ? timelineNodeTimestampLabel(node) : null;
+    const displayLabel = [node.label, timelineTimestampLabelText]
+      .filter((value): value is string => Boolean(value))
+      .join("\n");
     const memberCount = collectionPresentation.memberCounts.get(node.id) ?? 0;
     const isCollapsedCollection =
       isCollectionNode && memberCount > 0 && !collectionPresentation.expandedIds.has(node.id);
@@ -448,15 +932,24 @@ function flowNodes(
       : null;
     return {
       id: node.id,
+      type: "record",
       parentId: options.parentId,
-      extent: options.parentId ? "parent" : undefined,
+      extent: options.parentId
+        ? "parent"
+        : graph?.view === "timeline"
+          ? [
+              [position.x, -TIMELINE_VERTICAL_DRAG_BOUND],
+              [position.x, TIMELINE_VERTICAL_DRAG_BOUND],
+            ]
+          : undefined,
       position,
       data: {
         label: isCollapsedCollection
-          ? node.label + "\n▸ " + memberCount + (memberCount === 1 ? " member" : " members")
-          : node.label,
+          ? displayLabel + "\n▸ " + memberCount + (memberCount === 1 ? " member" : " members")
+          : displayLabel,
         kind: node.kind,
         collectionKind: node.collection_kind,
+        artifactRole: artifactRoleFor(node),
       },
       sourcePosition: Position.Right,
       targetPosition: Position.Left,
@@ -504,8 +997,156 @@ function flowNodes(
     };
   };
 
+  if (graph?.view === "timeline") {
+    const timedNodes = nodes
+      .map((node) => ({ node, timestamp: timelineTimestamp(node) }))
+      .filter((entry): entry is { node: GraphNode; timestamp: number } => entry.timestamp !== null)
+      .sort((left, right) => provenanceTimelineOrder(left.node, right.node));
+    const earliest = timedNodes.at(0)?.timestamp ?? Date.now();
+    const latest = timedNodes.at(-1)?.timestamp ?? earliest;
+    const tickStep = timelineTickStep(Math.max(1_000, latest - earliest));
+    const axisStart = Math.floor((earliest - tickStep) / tickStep) * tickStep;
+    const axisEnd = Math.ceil((latest + tickStep) / tickStep) * tickStep;
+    const axisSpan = Math.max(tickStep, axisEnd - axisStart);
+    const axisWidth = Math.min(
+      TIMELINE_MAX_WIDTH,
+      Math.max(TIMELINE_MIN_WIDTH, (axisSpan / tickStep) * 160),
+    );
+    const untimedInputX = TIMELINE_AXIS_LEFT - TIMELINE_UNTIMED_INPUT_OFFSET;
+    const hasUntimedInputs = nodes.some(
+      (node) => node.timeline_role === "input" && timelineTimestamp(node) === null,
+    );
+    const definitionAnchors = definitionInvocationAnchors(nodes, graph.edges);
+    const xFor = (node: GraphNode) => {
+      if (node.timeline_role === "input" && timelineTimestamp(node) === null) {
+        return untimedInputX;
+      }
+      const anchor = node.kind === "definition" ? definitionAnchors.get(node.id) : undefined;
+      const timestamp = timelineTimestamp(anchor ?? node) ?? axisStart;
+      return TIMELINE_AXIS_LEFT + ((timestamp - axisStart) / axisSpan) * axisWidth;
+    };
+    const invocationLanes = nodes
+      .filter((node) => node.kind === "invocation")
+      .sort((left, right) => {
+        const depth = Number(left.timeline_depth ?? 0) - Number(right.timeline_depth ?? 0);
+        return depth || provenanceTimelineOrder(left, right);
+      });
+    const laneIndex = new Map(invocationLanes.map((node, index) => [node.id, index]));
+    const unassignedLane = invocationLanes.length;
+    const placements = [...nodes]
+      .sort(provenanceTimelineOrder)
+      .map((node) => ({
+        node,
+        x: xFor(node),
+        lane: laneIndex.get(
+          node.timeline_lane ??
+            (node.kind === "definition" ? definitionAnchors.get(node.id)?.id : undefined) ??
+            node.id,
+        ) ?? unassignedLane,
+      }));
+    const trackEnds = new Map<string, number[]>();
+    const trackCounts = new Map<string, number>();
+    const placementTracks = new Map<string, number>();
+    for (const placement of placements) {
+      const trackKey = placement.lane + ":" + timelineTrackKind(placement.node);
+      const nodeWidth = placement.node.kind === "invocation" ? 260 : 240;
+      const tracks = trackEnds.get(trackKey) ?? [];
+      let track = tracks.findIndex((lastX) => lastX <= placement.x - nodeWidth - 24);
+      if (track === -1) {
+        track = tracks.length;
+        tracks.push(placement.x + nodeWidth);
+      } else {
+        tracks[track] = placement.x + nodeWidth;
+      }
+      trackEnds.set(trackKey, tracks);
+      trackCounts.set(trackKey, tracks.length);
+      placementTracks.set(placement.node.id, track);
+    }
+    const hasUnassignedLane = placements.some((placement) => placement.lane === unassignedLane);
+    const laneCount = invocationLanes.length + (hasUnassignedLane ? 1 : 0);
+    const laneStarts = new Map<number, number>();
+    let nextLaneY = 0;
+    for (let lane = 0; lane < laneCount; lane += 1) {
+      laneStarts.set(lane, nextLaneY);
+      const definitionTracks = trackCounts.get(lane + ":definition") ?? 0;
+      const inputTracks = trackCounts.get(lane + ":input") ?? 0;
+      const eventTracks = trackCounts.get(lane + ":event") ?? 0;
+      const evidenceTracks = trackCounts.get(lane + ":evidence") ?? 0;
+      const outputTracks = trackCounts.get(lane + ":output") ?? 0;
+      const invocationTracks = trackCounts.get(lane + ":invocation") ?? 0;
+      nextLaneY += Math.max(
+        205,
+        64 +
+          invocationTracks * 74 +
+          definitionTracks * 74 +
+          inputTracks * 74 +
+          eventTracks * 74 +
+          evidenceTracks * 74 +
+          outputTracks * 74,
+      );
+    }
+    const timelineNodes = placements.map(({ node, x, lane }) => {
+      const laneY = laneStarts.get(lane) ?? 0;
+      const track = placementTracks.get(node.id) ?? 0;
+      const definitionTracks = trackCounts.get(lane + ":definition") ?? 0;
+      const inputTracks = trackCounts.get(lane + ":input") ?? 0;
+      const eventTracks = trackCounts.get(lane + ":event") ?? 0;
+      const evidenceTracks = trackCounts.get(lane + ":evidence") ?? 0;
+      const invocationTracks = trackCounts.get(lane + ":invocation") ?? 0;
+      const typeOffset =
+        node.kind === "definition"
+          ? 0
+          : node.timeline_role === "input"
+            ? definitionTracks * 74
+          : node.kind === "invocation"
+            ? definitionTracks * 74 + inputTracks * 74
+          : node.kind === "event"
+              ? 64 + invocationTracks * 74 + definitionTracks * 74 + inputTracks * 74
+            : node.kind === "evidence"
+                ? 64 + invocationTracks * 74 + definitionTracks * 74 + inputTracks * 74 + eventTracks * 74
+                : 64 +
+                    invocationTracks * 74 +
+                    definitionTracks * 74 +
+                    inputTracks * 74 +
+                    eventTracks * 74 +
+                    evidenceTracks * 74;
+      return renderNode(node, { x, y: laneY + typeOffset + track * 74 });
+    });
+    const tickHeight = nextLaneY + 60;
+    const ticks: Node[] = [];
+    if (hasUntimedInputs) {
+      ticks.push({
+        id: "timeline-untimed-inputs",
+        type: "timelineTick",
+        position: { x: untimedInputX, y: -34 },
+        data: { label: "Untimed inputs", height: tickHeight },
+        draggable: false,
+        selectable: false,
+        connectable: false,
+        focusable: false,
+        zIndex: -1,
+      });
+    }
+    for (let value = axisStart; value <= axisEnd; value += tickStep) {
+      ticks.push({
+        id: "timeline-tick:" + value,
+        type: "timelineTick",
+        position: {
+          x: TIMELINE_AXIS_LEFT + ((value - axisStart) / axisSpan) * axisWidth,
+          y: -34,
+        },
+        data: { label: timelineTickLabel(value, tickStep), height: tickHeight },
+        draggable: false,
+        selectable: false,
+        connectable: false,
+        focusable: false,
+        zIndex: -1,
+      });
+    }
+    return [...ticks, ...timelineNodes];
+  }
+
   const rendered: Node[] = [];
-  const groupedSetNodes = nodes.filter((node) => artifactSets.memberNodesBySet.has(node.id));
   for (const artifactSet of groupedSetNodes) {
     const members = artifactSets.memberNodesBySet.get(artifactSet.id) ?? [];
     const { position } = positionFor(
@@ -532,36 +1173,123 @@ function flowNodes(
   return rendered;
 }
 
+const REVERSED_REFERENCE_FLOW_RELATIONS = new Set([
+  "contains",
+  "dataset-partition",
+  "definition",
+  "evidence-subject",
+  "event-invocation",
+  "event-reference",
+  "implementation",
+  "input",
+]);
+
+function asCausalFlowEdge(edge: GraphEdge): GraphEdge {
+  if (!REVERSED_REFERENCE_FLOW_RELATIONS.has(edge.relation)) return edge;
+  return { ...edge, source: edge.target, target: edge.source };
+}
+
+type DependencyTrace = {
+  downstream: Set<string>;
+  upstream: Set<string>;
+};
+
+function dependencyTraceEdgeIds(
+  edges: GraphEdge[],
+  selectedNodeId: string | null,
+): DependencyTrace {
+  if (!selectedNodeId) return { upstream: new Set(), downstream: new Set() };
+  const prerequisites = new Map<string, Array<{ edge: GraphEdge; nodeId: string }>>();
+  const dependents = new Map<string, Array<{ edge: GraphEdge; nodeId: string }>>();
+  const addPrerequisite = (dependent: string, prerequisite: string, edge: GraphEdge) => {
+    const prerequisiteEntries = prerequisites.get(dependent) ?? [];
+    prerequisiteEntries.push({ edge, nodeId: prerequisite });
+    prerequisites.set(dependent, prerequisiteEntries);
+    const dependentEntries = dependents.get(prerequisite) ?? [];
+    dependentEntries.push({ edge, nodeId: dependent });
+    dependents.set(prerequisite, dependentEntries);
+  };
+
+  // The visible graph is normalized to causal flow: every target depends on
+  // its source. That keeps arrowheads and bidirectional traversal meaningful
+  // even for Core references, whose JSON ownership direction is the reverse.
+  for (const edge of edges) addPrerequisite(edge.target, edge.source, edge);
+
+  const walk = (
+    adjacency: Map<string, Array<{ edge: GraphEdge; nodeId: string }>>,
+  ) => {
+    const edgeIds = new Set<string>();
+    const visited = new Set([selectedNodeId]);
+    const pending = [selectedNodeId];
+    while (pending.length) {
+      const nodeId = pending.pop()!;
+      for (const { edge, nodeId: adjacent } of adjacency.get(nodeId) ?? []) {
+        edgeIds.add(edge.id);
+        if (!visited.has(adjacent)) {
+          visited.add(adjacent);
+          pending.push(adjacent);
+        }
+      }
+    }
+    return edgeIds;
+  };
+
+  return {
+    upstream: walk(prerequisites),
+    downstream: walk(dependents),
+  };
+}
+
 function flowEdges(
   edges: GraphEdge[],
   theme: GraphTheme,
   containedEdgeIds: Set<string>,
+  dependencyTrace: DependencyTrace,
 ): Edge[] {
+  const hasDependencyTrace =
+    dependencyTrace.upstream.size > 0 || dependencyTrace.downstream.size > 0;
   return edges
     .filter(
       (edge) =>
         (edge.relation !== "contains" && edge.relation !== "dataset-partition") ||
         !containedEdgeIds.has(edge.id),
     )
-    .map((edge) => ({
-    id: edge.id,
-    source: edge.source,
-    target: edge.target,
-    animated: edge.relation === "consumes" || edge.relation === "produces",
-    markerEnd: { type: MarkerType.ArrowClosed, color: theme.referenceEdge },
-    style: {
-      stroke:
-        edge.relation === "produces"
-          ? theme.kinds.artifact
-          : edge.relation === "consumes"
-            ? theme.kinds.definition
+    .map((edge) => {
+    const isUpstream = dependencyTrace.upstream.has(edge.id);
+    const isDownstream = dependencyTrace.downstream.has(edge.id);
+    const isDependencyTrace = isUpstream || isDownstream;
+    const baseStroke =
+      edge.relation === "produces"
+        ? theme.kinds.artifact
+        : edge.relation === "consumes"
+          ? theme.kinds.definition
           : edge.relation === "dataset-partition"
             ? theme.kinds.artifact
-          : edge.relation === "contains"
+            : edge.relation === "contains"
               ? theme.kinds.artifact_set
               : edge.relation === "orchestrates"
                 ? theme.kinds.invocation
-              : theme.referenceEdge,
+                : theme.referenceEdge;
+    const stroke = isUpstream
+      ? theme.trace.upstream
+      : isDownstream
+        ? theme.trace.downstream
+        : baseStroke;
+    return {
+    id: edge.id,
+    source: edge.source,
+    target: edge.target,
+    type:
+      edge.relation === "contains" || edge.relation === "dataset-partition"
+        ? undefined
+        : "floating",
+    animated:
+      (edge.relation === "consumes" || edge.relation === "produces") &&
+      (!hasDependencyTrace || isDependencyTrace),
+    markerEnd: { type: MarkerType.ArrowClosed, color: stroke },
+    style: {
+      opacity: hasDependencyTrace && !isDependencyTrace ? 0.16 : 1,
+      stroke,
       strokeDasharray:
         edge.relation === "consumes" ||
         edge.relation === "produces" ||
@@ -569,17 +1297,22 @@ function flowEdges(
         edge.relation === "dataset-partition"
           ? undefined
           : "5 4",
+      strokeWidth: isDependencyTrace ? 2.8 : undefined,
     },
-    }));
+    zIndex: isDependencyTrace ? 2 : 0,
+    };
+    });
 }
 
 export default function App() {
   const [graph, setGraph] = useState<GraphPayload | null>(null);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [lineages, setLineages] = useState<RunLineage[]>([]);
+  const [selectedLineage, setSelectedLineage] = useState<string>();
   const [selectedRun, setSelectedRun] = useState<string>();
   const [selectedInvocation, setSelectedInvocation] = useState<string>();
-  const [expandedRuns, setExpandedRuns] = useState<Set<string>>(new Set());
+  const [expandedLineages, setExpandedLineages] = useState<Set<string>>(new Set());
   const [runFilter, setRunFilter] = useState("");
   const [runStatusFilter, setRunStatusFilter] =
     useState<RunStatusFilter>("all");
@@ -591,23 +1324,34 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [isExportingGif, setIsExportingGif] = useState(false);
   const [themeName, setThemeName] = useState<ThemeName>("dark");
+  const [baseView, setBaseView] = useState<BaseGraphView>("run");
+  const [isProvenanceVisible, setIsProvenanceVisible] = useState(false);
+  const [isLineageExplorerVisible, setIsLineageExplorerVisible] = useState(true);
+  const [isDetailPanelVisible, setIsDetailPanelVisible] = useState(true);
+  const [provenanceGraph, setProvenanceGraph] = useState<GraphPayload | null>(null);
   const [expandedCollections, setExpandedCollections] = useState<Set<string>>(
     new Set(),
   );
+  const [nodePositionsByScope, setNodePositionsByScope] =
+    useState<NodePositionsByScope>({});
   const flow = useRef<ReactFlowInstance | null>(null);
   const graphPanelRef = useRef<HTMLDivElement | null>(null);
   const selectedRecordRequest = useRef<AbortController | null>(null);
   const didInitialize = useRef(false);
   const theme = GRAPH_THEMES[themeName];
+  const displayGraph = useMemo(
+    () => mergeProvenanceOverlay(graph, isProvenanceVisible ? provenanceGraph : null),
+    [graph, isProvenanceVisible, provenanceGraph],
+  );
   const graphNodeById = useMemo(
     () =>
       new Map(
-        [...(graph?.nodes ?? []), ...(graph?.collection_nodes ?? [])].map((node) => [
+        [...(displayGraph?.nodes ?? []), ...(displayGraph?.collection_nodes ?? [])].map((node) => [
           node.id,
           node,
         ]),
       ),
-    [graph],
+    [displayGraph],
   );
 
   const loadGraph = useCallback(async (
@@ -620,7 +1364,9 @@ export default function App() {
       setError(null);
       const parameters = new URLSearchParams({ view });
       if (run) parameters.set("run", run);
-      if (invocation && view !== "run") parameters.set("invocation", invocation);
+      if (invocation && (view === "derivation" || view === "provenance")) {
+        parameters.set("invocation", invocation);
+      }
       const graphPath = path ?? "/api/graph?" + parameters.toString();
       const [graphResponse, healthResponse] = await Promise.all([
         fetch(graphPath),
@@ -636,21 +1382,45 @@ export default function App() {
     }
   }, []);
 
+  const loadProvenanceOverlay = useCallback(async (run?: string, invocation?: string) => {
+    if (!invocation) {
+      setProvenanceGraph(null);
+      return false;
+    }
+    try {
+      const parameters = new URLSearchParams({ view: "provenance", invocation });
+      if (run) parameters.set("run", run);
+      const response = await fetch("/api/graph?" + parameters.toString());
+      if (!response.ok) throw new Error("CYCLOPS could not load provenance context.");
+      setProvenanceGraph((await response.json()) as GraphPayload);
+      return true;
+    } catch (loadError) {
+      setError((loadError as Error).message);
+      return false;
+    }
+  }, []);
+
   const loadRuns = useCallback(async (openFirstRun = false) => {
     try {
       const response = await fetch("/api/runs");
       if (!response.ok) throw new Error("CYCLOPS could not list runs.");
       const payload = (await response.json()) as RunsPayload;
       setRuns(payload.runs);
-      setExpandedRuns((current) => {
-        const available = new Set(payload.runs.map((run) => run.id));
-        return new Set([...current].filter((runId) => available.has(runId)));
+      setLineages(payload.lineages);
+      setExpandedLineages((current) => {
+        const available = new Set(payload.lineages.map((lineage) => lineage.id));
+        return new Set([...current].filter((lineageId) => available.has(lineageId)));
       });
       if (openFirstRun) {
-        const first = payload.runs[0];
+        const firstLineage = payload.lineages[0];
+        const first = firstLineage?.runs[0] ?? payload.runs[0];
+        setSelectedLineage(firstLineage?.id);
         setSelectedRun(first?.id);
         setSelectedInvocation(first?.invocations[0]?.id);
-        setExpandedRuns(first ? new Set([first.id]) : new Set());
+        setExpandedLineages(firstLineage ? new Set([firstLineage.id]) : new Set());
+        setBaseView("run");
+        setIsProvenanceVisible(false);
+        setProvenanceGraph(null);
         await loadGraph(first ? "run" : "derivation", first?.id);
       }
     } catch (loadError) {
@@ -671,10 +1441,13 @@ export default function App() {
         await Promise.all([
           loadRuns(),
           loadGraph(
-            graph?.view ?? "run",
+            baseView,
             selectedRun,
-            selectedInvocation,
+            baseView === "derivation" ? selectedInvocation : undefined,
           ),
+          isProvenanceVisible
+            ? loadProvenanceOverlay(selectedRun, selectedInvocation)
+            : Promise.resolve(true),
         ]);
       }
     } catch (loadError) {
@@ -682,7 +1455,7 @@ export default function App() {
     } finally {
       setIsRefreshing(false);
     }
-  }, [graph?.view, loadGraph, loadRuns, selectedInvocation, selectedRun]);
+  }, [baseView, isProvenanceVisible, loadGraph, loadProvenanceOverlay, loadRuns, selectedInvocation, selectedRun]);
 
   useEffect(() => {
     if (didInitialize.current) return;
@@ -692,22 +1465,20 @@ export default function App() {
 
   const visibleNodes = useMemo(() => {
     if (
-      !graph ||
-      (graph.view !== "run" &&
-        graph.view !== "derivation" &&
-        graph.view !== "provenance")
+      !displayGraph ||
+      (displayGraph.view !== "run" && displayGraph.view !== "derivation")
     ) {
-      return graph?.nodes ?? [];
+      return displayGraph?.nodes ?? [];
     }
-    const collapsedMembers = collapsedCollectionMemberIds(graph, expandedCollections);
+    const collapsedMembers = collapsedCollectionMemberIds(displayGraph, expandedCollections);
     const nodes = new Map(
-      graph.nodes
+      displayGraph.nodes
         .filter((node) => !collapsedMembers.has(node.id))
         .map((node) => [node.id, node]),
     );
-    for (const node of graph.collection_nodes) {
+    for (const node of displayGraph.collection_nodes) {
       if (
-        graph.collection_edges.some(
+        displayGraph.collection_edges.some(
           (edge) => edge.target === node.id && expandedCollections.has(edge.source),
         )
       ) {
@@ -715,56 +1486,104 @@ export default function App() {
       }
     }
     return [...nodes.values()];
-  }, [expandedCollections, graph]);
+  }, [displayGraph, expandedCollections]);
   const visibleEdges = useMemo(() => {
-    if (
-      !graph ||
-      (graph.view !== "run" &&
-        graph.view !== "derivation" &&
-        graph.view !== "provenance")
-    ) {
-      return graph?.edges ?? [];
+    if (!displayGraph) return [];
+    if (displayGraph.view !== "run" && displayGraph.view !== "derivation") {
+      return displayGraph.edges.map(asCausalFlowEdge);
     }
     const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
     return [
-      ...graph.edges,
-      ...graph.collection_edges,
-    ].filter(
-      (edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target),
-    );
-  }, [graph, visibleNodes]);
+      ...displayGraph.edges,
+      ...displayGraph.collection_edges,
+    ]
+      .filter(
+        (edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target),
+      )
+      .map(asCausalFlowEdge);
+  }, [displayGraph, visibleNodes]);
   const groupedCollections = useMemo(
-    () => collectionGrouping(visibleNodes, graph?.collection_edges ?? []),
-    [graph?.collection_edges, visibleNodes],
+    () => collectionGrouping(visibleNodes, displayGraph?.collection_edges ?? []),
+    [displayGraph?.collection_edges, visibleNodes],
   );
-  const memberCounts = useMemo(() => collectionMemberCounts(graph), [graph]);
+  const selectedDependencyTrace = useMemo(
+    () => dependencyTraceEdgeIds(visibleEdges, selectedNodeId),
+    [selectedNodeId, visibleEdges],
+  );
+  const memberCounts = useMemo(() => collectionMemberCounts(displayGraph), [displayGraph]);
   const nodes = useMemo(
     () =>
-      flowNodes(graph, visibleNodes, theme, selectedNodeId, groupedCollections, {
+      flowNodes(displayGraph, visibleNodes, theme, selectedNodeId, groupedCollections, {
         memberCounts,
         expandedIds: expandedCollections,
       }),
-    [expandedCollections, graph, groupedCollections, memberCounts, selectedNodeId, theme, visibleNodes],
+    [displayGraph, expandedCollections, groupedCollections, memberCounts, selectedNodeId, theme, visibleNodes],
   );
+  const layoutScope = useMemo(
+    () =>
+      [
+        GRAPH_LAYOUT_VERSION,
+        displayGraph?.view ?? "unloaded",
+        selectedRun ?? "",
+        displayGraph?.view === "derivation"
+          ? selectedInvocation ?? ""
+          : "",
+      ].join(":"),
+    [displayGraph?.view, selectedInvocation, selectedRun],
+  );
+  const positionedNodes = useMemo(() => {
+    const positions = nodePositionsByScope[layoutScope] ?? {};
+    return nodes.map((node) =>
+      positions[node.id] ? { ...node, position: positions[node.id] } : node,
+    );
+  }, [layoutScope, nodePositionsByScope, nodes]);
   const edges = useMemo(
     () =>
       flowEdges(
         visibleEdges,
         theme,
         groupedCollections.containedEdgeIds,
+      selectedDependencyTrace,
       ),
-    [groupedCollections, theme, visibleEdges],
+    [groupedCollections, selectedDependencyTrace, theme, visibleEdges],
   );
 
+  const updateNodePositions = useCallback((changes: NodeChange<Node>[]) => {
+    const isTimeline = displayGraph?.view === "timeline";
+    setNodePositionsByScope((current) => {
+      const currentScope = current[layoutScope] ?? {};
+      const nextScope = { ...currentScope };
+      let changed = false;
+      for (const change of changes) {
+        if (change.type !== "position" || change.position === undefined) continue;
+        const node = nodes.find((candidate) => candidate.id === change.id);
+        if (!node || node.type === "timelineTick") continue;
+        const position = {
+          x: isTimeline ? node.position.x : change.position.x,
+          y: change.position.y,
+        };
+        if (
+          currentScope[change.id]?.x === position.x &&
+          currentScope[change.id]?.y === position.y
+        ) {
+          continue;
+        }
+        nextScope[change.id] = position;
+        changed = true;
+      }
+      return changed ? { ...current, [layoutScope]: nextScope } : current;
+    });
+  }, [displayGraph?.view, layoutScope, nodes]);
+
   useEffect(() => {
-    if (!graph) return;
+    if (!displayGraph) return;
     const animation = requestAnimationFrame(() => {
       flow.current?.fitView({ duration: 260, padding: 0.18 });
     });
     return () => cancelAnimationFrame(animation);
   // A node selection only changes local styling and the detail panel. It must
   // not refit the viewport; collection expansion intentionally does.
-  }, [expandedCollections, graph]);
+  }, [displayGraph, expandedCollections]);
 
   const clearSelectedRecord = useCallback(() => {
     selectedRecordRequest.current?.abort();
@@ -776,6 +1595,10 @@ export default function App() {
   }, []);
 
   const selectNode: NodeMouseHandler = useCallback(async (_event, node) => {
+    if (node.id === selectedNodeId) {
+      clearSelectedRecord();
+      return;
+    }
     selectedRecordRequest.current?.abort();
     const controller = new AbortController();
     selectedRecordRequest.current = controller;
@@ -802,7 +1625,7 @@ export default function App() {
         setIsSelectedLoading(false);
       }
     }
-  }, []);
+  }, [clearSelectedRecord, selectedNodeId]);
 
   useEffect(() => {
     clearSelectedRecord();
@@ -847,11 +1670,17 @@ export default function App() {
   const exportFlowGif = useCallback(async () => {
     const graphPanel = graphPanelRef.current;
     if (!graphPanel || !graph) return;
+    const originalViewport = flow.current?.getViewport();
+    let viewportRestored = false;
     setError(null);
     setIsExportingGif(true);
     try {
       // Let the export class hide the on-screen controls before cloning the
       // graph panel for the still background frame.
+      await waitForAnimationFrame(0);
+      // Fit the selected graph scope for the export only. The user’s working
+      // viewport is restored immediately after the background is captured.
+      await flow.current?.fitView({ duration: 0, padding: 0.12 });
       await waitForAnimationFrame(0);
       const bounds = graphPanel.getBoundingClientRect();
       if (bounds.width <= 0 || bounds.height <= 0) {
@@ -872,10 +1701,16 @@ export default function App() {
       if (!context) throw new Error("CYCLOPS could not read the graph capture.");
       const baseImage = context.getImageData(0, 0, canvas.width, canvas.height);
       const pulses = gifFlowPulses(graphPanel, scale);
+      const nodeRects = gifNodeRects(graphPanel, scale, canvas.width, canvas.height);
+      if (originalViewport) {
+        await flow.current?.setViewport(originalViewport, { duration: 0 });
+        viewportRestored = true;
+      }
 
       for (let frame = 0; frame < GIF_FRAME_COUNT; frame += 1) {
         context.putImageData(baseImage, 0, 0);
         drawGifFlowPulses(context, pulses, frame, scale);
+        restoreGifNodeLayers(context, baseImage, nodeRects);
         const image = context.getImageData(0, 0, canvas.width, canvas.height);
         const palette = quantize(image.data, 256);
         gif.writeFrame(applyPalette(image.data, palette), canvas.width, canvas.height, {
@@ -896,7 +1731,7 @@ export default function App() {
       const href = URL.createObjectURL(blob);
       const download = document.createElement("a");
       download.href = href;
-      download.download = gifFilename(graph);
+      download.download = gifFilename(displayGraph);
       download.click();
       window.setTimeout(() => URL.revokeObjectURL(href), 0);
     } catch (caught) {
@@ -906,9 +1741,37 @@ export default function App() {
           : "CYCLOPS could not export this graph.",
       );
     } finally {
+      if (originalViewport && !viewportRestored) {
+        void flow.current?.setViewport(originalViewport, { duration: 0 });
+      }
       setIsExportingGif(false);
     }
-  }, [graph, theme.canvasBackground]);
+  }, [displayGraph, graph, theme.canvasBackground]);
+
+  const showBaseView = useCallback((view: BaseGraphView) => {
+    setBaseView(view);
+    void loadGraph(
+      view,
+      selectedRun,
+      view === "derivation" ? selectedInvocation : undefined,
+    );
+  }, [loadGraph, selectedInvocation, selectedRun]);
+
+  const toggleProvenance = useCallback(() => {
+    if (isProvenanceVisible) {
+      setIsProvenanceVisible(false);
+      setProvenanceGraph(null);
+      return;
+    }
+    if (!selectedInvocation) {
+      setError("Select an Invocation before showing its provenance context.");
+      return;
+    }
+    setIsProvenanceVisible(true);
+    void loadProvenanceOverlay(selectedRun, selectedInvocation).then((loaded) => {
+      if (!loaded) setIsProvenanceVisible(false);
+    });
+  }, [isProvenanceVisible, loadProvenanceOverlay, selectedInvocation, selectedRun]);
 
   useEffect(() => {
     setCopied(false);
@@ -931,90 +1794,128 @@ export default function App() {
     }
   }, [graph?.view, loadGraph, selected, selectedInvocation, selectedRun]);
 
-  const selectRun = useCallback((runId: string) => {
+  const selectLineage = useCallback((lineageId: string) => {
+    const lineage = lineages.find((candidate) => candidate.id === lineageId);
+    const run = lineage?.runs[0];
+    clearSelectedRecord();
+    setSelectedLineage(lineageId || undefined);
+    setSelectedRun(run?.id);
+    setSelectedInvocation(run?.invocations[0]?.id);
+    setExpandedLineages((current) => new Set([...current, lineageId]));
+    setExpandedCollections(new Set());
+    setBaseView("run");
+    void loadGraph("run", run?.id);
+    if (isProvenanceVisible) {
+      void loadProvenanceOverlay(run?.id, run?.invocations[0]?.id);
+    }
+  }, [clearSelectedRecord, isProvenanceVisible, lineages, loadGraph, loadProvenanceOverlay]);
+
+  const selectRun = useCallback((lineageId: string, runId: string) => {
     const selected = runId || undefined;
     const run = runs.find((candidate) => candidate.id === selected);
     clearSelectedRecord();
+    setSelectedLineage(lineageId || undefined);
     setSelectedRun(selected);
     setSelectedInvocation(run?.invocations[0]?.id);
-    setExpandedRuns((current) => new Set([...current, runId]));
+    setExpandedLineages((current) => new Set([...current, lineageId]));
     setExpandedCollections(new Set());
+    setBaseView("run");
     void loadGraph("run", selected);
-  }, [clearSelectedRecord, loadGraph, runs]);
+    if (isProvenanceVisible) {
+      void loadProvenanceOverlay(selected, run?.invocations[0]?.id);
+    }
+  }, [clearSelectedRecord, isProvenanceVisible, loadGraph, loadProvenanceOverlay, runs]);
 
-  const selectInvocation = useCallback((runId: string, invocationId: string) => {
+  const selectInvocation = useCallback((lineageId: string, runId: string, invocationId: string) => {
     clearSelectedRecord();
+    setSelectedLineage(lineageId || undefined);
     setSelectedRun(runId);
     setSelectedInvocation(invocationId || undefined);
-    setExpandedRuns((current) => new Set([...current, runId]));
+    setExpandedLineages((current) => new Set([...current, lineageId]));
     setExpandedCollections(new Set());
-    void loadGraph(
-      graph?.view === "provenance" ? "provenance" : "derivation",
-      runId,
-      invocationId || undefined,
-    );
-  }, [clearSelectedRecord, graph?.view, loadGraph]);
+    const view = baseView === "timeline" ? "timeline" : "derivation";
+    if (view === "derivation") setBaseView("derivation");
+    void loadGraph(view, runId, invocationId || undefined);
+    if (isProvenanceVisible) {
+      void loadProvenanceOverlay(runId, invocationId || undefined);
+    }
+  }, [baseView, clearSelectedRecord, isProvenanceVisible, loadGraph, loadProvenanceOverlay]);
 
-  const toggleRun = useCallback((runId: string) => {
-    setExpandedRuns((current) => {
+  const toggleLineage = useCallback((lineageId: string) => {
+    setExpandedLineages((current) => {
       const next = new Set(current);
-      if (next.has(runId)) next.delete(runId);
-      else next.add(runId);
+      if (next.has(lineageId)) next.delete(lineageId);
+      else next.add(lineageId);
       return next;
     });
   }, []);
 
-  const filteredRuns = useMemo<FilteredRun[]>(() => {
+  const filteredLineages = useMemo<FilteredLineage[]>(() => {
     const query = runFilter.trim().toLocaleLowerCase();
-    return runs.flatMap((run) => {
-      const runMatchesQuery = [run.label, run.record_id]
+    return lineages.flatMap((lineage) => {
+      const lineageMatchesQuery = [lineage.label, lineage.id]
         .join(" ")
         .toLocaleLowerCase()
         .includes(query);
-      const hasNestedWork = run.invocations.some((invocation) => invocation.depth > 0);
-      const matchingInvocations = run.invocations.filter(
-        (invocation) =>
-          invocationMatchesStatus(invocation, runStatusFilter) &&
-          (!query || runMatchesQuery || invocationMatchesQuery(invocation, query)),
-      );
-      const matchingWork = hasNestedWork
-        ? matchingInvocations.filter((invocation) => invocation.depth > 0)
-        : matchingInvocations;
-      if (matchingWork.length === 0) return [];
+      const matchingRuns = lineage.runs.flatMap((run) => {
+        const runMatchesQuery = [run.label, run.record_id]
+          .join(" ")
+          .toLocaleLowerCase()
+          .includes(query);
+        const hasNestedWork = run.invocations.some((invocation) => invocation.depth > 0);
+        const matchingInvocations = run.invocations.filter(
+          (invocation) =>
+            invocationMatchesStatus(invocation, runStatusFilter) &&
+            (!query || lineageMatchesQuery || runMatchesQuery || invocationMatchesQuery(invocation, query)),
+        );
+        const matchingWork = hasNestedWork
+          ? matchingInvocations.filter((invocation) => invocation.depth > 0)
+          : matchingInvocations;
+        if (matchingWork.length === 0) return [];
 
-      const visibleInvocationIds = new Set(matchingWork.map((invocation) => invocation.id));
-      if (hasNestedWork) {
-        for (const invocation of run.invocations) {
-          if (invocation.depth === 0) visibleInvocationIds.add(invocation.id);
+        const visibleInvocationIds = new Set(matchingWork.map((invocation) => invocation.id));
+        if (hasNestedWork) {
+          for (const invocation of run.invocations) {
+            if (invocation.depth === 0) visibleInvocationIds.add(invocation.id);
+          }
         }
-      }
+        return [{
+          run,
+          invocations: run.invocations.filter((invocation) => visibleInvocationIds.has(invocation.id)),
+          matchingInvocationCount: matchingWork.length,
+        }];
+      });
+      if (matchingRuns.length === 0) return [];
       return [{
-        run,
-        invocations: run.invocations.filter((invocation) => visibleInvocationIds.has(invocation.id)),
-        matchingInvocationCount: matchingWork.length,
+        lineage,
+        runs: matchingRuns,
+        matchingInvocationCount: matchingRuns.reduce(
+          (count, run) => count + run.matchingInvocationCount,
+          0,
+        ),
       }];
     });
-  }, [runFilter, runStatusFilter, runs]);
+  }, [lineages, runFilter, runStatusFilter]);
   const hasRunFilter = Boolean(runFilter.trim()) || runStatusFilter !== "all";
   const matchingInvocationCount = useMemo(
-    () => filteredRuns.reduce((count, filteredRun) => count + filteredRun.matchingInvocationCount, 0),
-    [filteredRuns],
+    () => filteredLineages.reduce((count, lineage) => count + lineage.matchingInvocationCount, 0),
+    [filteredLineages],
   );
 
   useEffect(() => {
     if (!hasRunFilter) return;
-    setExpandedRuns((current) => {
+    setExpandedLineages((current) => {
       const next = new Set(current);
       let changed = false;
-      for (const { run } of filteredRuns) {
-        if (!next.has(run.id)) {
-          next.add(run.id);
+      for (const { lineage } of filteredLineages) {
+        if (!next.has(lineage.id)) {
+          next.add(lineage.id);
           changed = true;
         }
       }
       return changed ? next : current;
     });
-  }, [filteredRuns, hasRunFilter]);
+  }, [filteredLineages, hasRunFilter]);
 
   return (
     <main className={"app-shell theme-" + themeName}>
@@ -1043,47 +1944,74 @@ export default function App() {
               {themeName === "dark" ? "Light" : "Dark"}
             </button>
             <button
-              aria-label="Export the visible graph as an animated GIF"
+              aria-label="Export the current graph as an animated GIF"
               className="export-gif"
               disabled={!graph || isExportingGif}
               onClick={() => void exportFlowGif()}
-              title="Export the visible graph with animated Data DAG edges"
+              title="Export the complete current graph with animated data-flow edges"
             >
               {isExportingGif ? "Exporting…" : "Export GIF"}
             </button>
             <div className="view-toggle" role="group" aria-label="Graph view">
               <button
-                aria-pressed={graph?.view === "run"}
-                className={graph?.view === "run" ? "is-active" : undefined}
-                onClick={() => void loadGraph("run", selectedRun)}
+                aria-pressed={baseView === "run"}
+                className={baseView === "run" ? "is-active" : undefined}
+                onClick={() => showBaseView("run")}
               >
-              Run graph
+                Run lineage
               </button>
               <button
-                aria-pressed={graph?.view === "derivation"}
-                className={graph?.view === "derivation" ? "is-active" : undefined}
-                onClick={() => void loadGraph("derivation", selectedRun, selectedInvocation)}
+                aria-pressed={baseView === "derivation"}
+                className={baseView === "derivation" ? "is-active" : undefined}
+                onClick={() => showBaseView("derivation")}
               >
               Data DAG
               </button>
               <button
-                aria-pressed={graph?.view === "provenance"}
-                className={graph?.view === "provenance" ? "is-active" : undefined}
-                onClick={() => void loadGraph("provenance", selectedRun, selectedInvocation)}
+                aria-pressed={baseView === "timeline"}
+                className={baseView === "timeline" ? "is-active" : undefined}
+                disabled={!selectedRun}
+                onClick={() => showBaseView("timeline")}
               >
-              OCLP Provenance
+                Timeline
               </button>
             </div>
+            <button
+              aria-checked={isProvenanceVisible}
+              aria-label="Toggle provenance context"
+              className={
+                "provenance-switch" + (isProvenanceVisible ? " is-active" : "")
+              }
+              disabled={!graph || !selectedInvocation}
+              onClick={toggleProvenance}
+              role="switch"
+              title="Show provenance context for the selected Invocation"
+            >
+              <span aria-hidden="true" className="provenance-switch-track">
+                <span className="provenance-switch-thumb" />
+              </span>
+              Provenance
+            </button>
           </div>
         </div>
       </header>
       {error ? <p className="error">{error}</p> : null}
-      <section className="workspace">
+      <section
+        className={[
+          "workspace",
+          isLineageExplorerVisible ? "" : "is-lineage-explorer-hidden",
+          isDetailPanelVisible ? "" : "is-detail-panel-hidden",
+        ].filter(Boolean).join(" ")}
+      >
+        {isLineageExplorerVisible ? (
         <aside className="run-panel">
           <div className="run-panel-heading">
-            <p className="eyebrow">Run explorer</p>
+            <p className="eyebrow">Lineage explorer</p>
             <div className="run-panel-actions">
-              <span>{runs.length} run{runs.length === 1 ? "" : "s"}</span>
+              <span>
+                {lineages.length} lineage{lineages.length === 1 ? "" : "s"}
+                {" · "}{runs.length} root run{runs.length === 1 ? "" : "s"}
+              </span>
               <button
                 aria-label="Refresh OCLP project"
                 className="run-refresh"
@@ -1097,12 +2025,20 @@ export default function App() {
               >
                 {isRefreshing ? "…" : "↻"}
               </button>
+              <button
+                aria-label="Hide Lineage Explorer"
+                className="run-panel-visibility-toggle"
+                onClick={() => setIsLineageExplorerVisible(false)}
+                title="Hide Lineage Explorer"
+              >
+                <PanelLeftClose aria-hidden="true" size={15} />
+              </button>
             </div>
           </div>
           <input
-            aria-label="Search runs and invocations"
+            aria-label="Search lineages, runs, and invocations"
             onChange={(event) => setRunFilter(event.target.value)}
-            placeholder="Search runs and invocations"
+            placeholder="Search lineages, runs, and invocations"
             type="search"
             value={runFilter}
           />
@@ -1121,109 +2057,146 @@ export default function App() {
           {hasRunFilter ? (
             <p className="run-filter-summary">
               {matchingInvocationCount} matching invocation{matchingInvocationCount === 1 ? "" : "s"}
-              {" in "}{filteredRuns.length} run{filteredRuns.length === 1 ? "" : "s"}
+              {" in "}{filteredLineages.length} lineage{filteredLineages.length === 1 ? "" : "s"}
             </p>
           ) : null}
-          <div className="run-tree" role="tree" aria-label="OCLP runs">
-            {filteredRuns.map(({ run, invocations }) => {
-              const expanded = expandedRuns.has(run.id);
+          <div className="run-tree" role="tree" aria-label="OCLP run lineages">
+            {filteredLineages.map(({ lineage, runs: lineageRuns }) => {
+              const expanded = expandedLineages.has(lineage.id);
               return (
-                <section className="run-tree-item" key={run.id}>
+                <section className="run-tree-item" key={lineage.id}>
                   <div className="run-tree-root">
                     <button
                       aria-expanded={expanded}
-                      aria-label={(expanded ? "Collapse " : "Expand ") + run.label}
+                      aria-label={(expanded ? "Collapse " : "Expand ") + lineage.label}
                       className="run-tree-disclosure"
-                      onClick={() => toggleRun(run.id)}
+                      onClick={() => toggleLineage(lineage.id)}
                     >
                       {expanded ? "▾" : "▸"}
                     </button>
                     <button
-                      aria-current={selectedRun === run.id ? "true" : undefined}
+                      aria-current={selectedLineage === lineage.id ? "true" : undefined}
                       className={
                         "run-tree-run" +
-                        (selectedRun === run.id && graph?.view === "run"
+                        (selectedLineage === lineage.id && baseView === "run"
                           ? " is-active"
                           : "")
                       }
-                      onClick={() => selectRun(run.id)}
-                      title={run.record_id}
+                      onClick={() => selectLineage(lineage.id)}
+                      title={lineage.id}
                     >
-                      <span>{run.label}</span>
+                      <span>Lineage · {lineage.label}</span>
                       <small>
-                        {statusSummary(run.status_counts)}
-                        {" · "}{run.artifact_count} artifact{run.artifact_count === 1 ? "" : "s"}
-                        {timelineSummary(run) ? " · " + timelineSummary(run) : ""}
+                        {lineage.root_count} root run{lineage.root_count === 1 ? "" : "s"}
+                        {" · "}{statusSummary(lineage.status_counts)}
+                        {" · "}{lineage.artifact_count} artifact{lineage.artifact_count === 1 ? "" : "s"}
                       </small>
                     </button>
                   </div>
                   {expanded ? (
-                    <div className="run-tree-children" role="group">
-                      {invocations.map((invocation) => (
-                        <button
-                          aria-current={selectedInvocation === invocation.id ? "true" : undefined}
-                          className={
-                            "run-tree-invocation" +
-                            (selectedInvocation === invocation.id && graph?.view !== "run"
-                              ? " is-active"
-                              : "")
-                          }
-                          key={invocation.id}
-                          onClick={() => selectInvocation(run.id, invocation.id)}
-                          style={{ paddingLeft: 14 + invocation.depth * 18 }}
-                          title={[
-                            invocation.record_id,
-                            diagnosticText(invocation.diagnostic),
-                          ].filter(Boolean).join("\n")}
-                        >
-                          <span
-                            aria-hidden="true"
+                    <div className="lineage-tree-runs" role="group">
+                      {lineageRuns.map(({ run, invocations }) => (
+                        <section className="lineage-tree-run" key={run.id}>
+                          <button
+                            aria-current={selectedRun === run.id && baseView === "run" ? "true" : undefined}
                             className={
-                              invocation.depth === 0
-                                ? "run-tree-root-icon"
-                                : "run-status status-" + (invocation.status ?? "incomplete")
+                              "lineage-tree-run-heading" +
+                              (selectedRun === run.id && baseView === "run" ? " is-active" : "")
                             }
+                            onClick={() => selectRun(lineage.id, run.id)}
+                            title={run.record_id}
                           >
-                            {invocation.depth === 0 ? "◇" : "●"}
-                          </span>
-                          <span className="run-tree-invocation-copy">
-                            <span>
-                              {invocation.depth === 0
-                                ? "Root"
-                                : statusLabel(invocation.status)}
-                              {" · "}{invocation.label}
-                            </span>
-                            {invocation.depth > 0 &&
-                            diagnosticText(invocation.diagnostic) ? (
-                              <small>
-                                {diagnosticText(invocation.diagnostic)}
-                              </small>
-                            ) : null}
-                          </span>
-                        </button>
+                            <span>Root run · {run.label}</span>
+                            <small>
+                              {statusSummary(run.status_counts)}
+                              {" · "}{run.artifact_count} artifact{run.artifact_count === 1 ? "" : "s"}
+                              {timelineSummary(run) ? " · " + timelineSummary(run) : ""}
+                            </small>
+                          </button>
+                          <div className="run-tree-children" role="group">
+                            {invocations.map((invocation) => (
+                              <button
+                                aria-current={selectedInvocation === invocation.id ? "true" : undefined}
+                                className={
+                                  "run-tree-invocation" +
+                                  (selectedInvocation === invocation.id && baseView !== "run"
+                                    ? " is-active"
+                                    : "")
+                                }
+                                key={invocation.id}
+                                onClick={() => selectInvocation(lineage.id, run.id, invocation.id)}
+                                style={{ paddingLeft: 14 + invocation.depth * 18 }}
+                                title={[
+                                  invocation.record_id,
+                                  diagnosticText(invocation.diagnostic),
+                                ].filter(Boolean).join("\n")}
+                              >
+                                <span
+                                  aria-hidden="true"
+                                  className={
+                                    invocation.depth === 0
+                                      ? "run-tree-root-icon"
+                                      : "run-status status-" + (invocation.status ?? "incomplete")
+                                  }
+                                >
+                                  {invocation.depth === 0 ? "◇" : "●"}
+                                </span>
+                                <span className="run-tree-invocation-copy">
+                                  <span>
+                                    {invocation.depth === 0
+                                      ? "Root invocation"
+                                      : statusLabel(invocation.status)}
+                                    {" · "}{invocation.label}
+                                  </span>
+                                  {invocation.depth > 0 &&
+                                  diagnosticText(invocation.diagnostic) ? (
+                                    <small>
+                                      {diagnosticText(invocation.diagnostic)}
+                                    </small>
+                                  ) : null}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        </section>
                       ))}
                     </div>
                   ) : null}
                 </section>
               );
             })}
-            {filteredRuns.length === 0 ? (
-              <p className="run-tree-empty">No matching runs.</p>
+            {filteredLineages.length === 0 ? (
+              <p className="run-tree-empty">No matching lineages.</p>
             ) : null}
           </div>
         </aside>
+        ) : (
+          <button
+            aria-label="Show Lineage Explorer"
+            className="show-run-panel"
+            onClick={() => setIsLineageExplorerVisible(true)}
+            title="Show Lineage Explorer"
+          >
+            <PanelLeftOpen aria-hidden="true" size={18} />
+          </button>
+        )}
         <div
           className={"graph-panel" + (isExportingGif ? " is-exporting-gif" : "")}
           ref={graphPanelRef}
         >
           <ReactFlow
-            nodes={nodes}
+            nodes={positionedNodes}
             edges={edges}
+            nodeTypes={nodeTypes}
+            edgeTypes={edgeTypes}
+            minZoom={0.05}
             onInit={(instance) => {
               flow.current = instance;
             }}
             onNodeClick={selectNode}
+            onPaneClick={clearSelectedRecord}
             onNodeDoubleClick={toggleCollectionNode}
+            onNodesChange={updateNodePositions}
             nodesConnectable={false}
             nodesDraggable
             proOptions={{ hideAttribution: true }}
@@ -1240,8 +2213,19 @@ export default function App() {
             />
           </ReactFlow>
         </div>
+        {isDetailPanelVisible ? (
         <aside className="detail-panel">
-          <p className="eyebrow">Selected record</p>
+          <div className="detail-panel-heading">
+            <p className="eyebrow">Selected record</p>
+            <button
+              aria-label="Hide Selected Record panel"
+              className="detail-panel-visibility-toggle"
+              onClick={() => setIsDetailPanelVisible(false)}
+              title="Hide Selected Record panel"
+            >
+              <PanelRightClose aria-hidden="true" size={15} />
+            </button>
+          </div>
           {selected ? (
             <>
               <h2>{String(selected.record.kind)}</h2>
@@ -1253,7 +2237,7 @@ export default function App() {
                     : "Expand members"}
                 </button>
               ) : null}
-              <button onClick={showLineage}>Show 3-hop lineage</button>
+              <button onClick={showLineage}>Show 3-hop data lineage</button>
               <button
                 aria-label="Copy selected record JSON to clipboard"
                 className="copy-json"
@@ -1269,14 +2253,25 @@ export default function App() {
             <p>Loading selected record…</p>
           ) : (
             <p>
-              Inspect the selected root Invocation and all explicitly nested
-              work in the Run graph. Select an Invocation in the Run explorer
-              for that Invocation&apos;s Data DAG or Provenance context. Double-click
-              a collection to expand or collapse its member Artifacts.
+              Start with Run lineage to see the connected execution roots and
+              their data handoffs. Use Data DAG for strict Artifact → Invocation
+              → Artifact flow, Timeline for chronology, and the Provenance
+              switch for selected-Invocation context. Double-click a collection
+              to expand or collapse its member Artifacts.
             </p>
           )}
           {summary ? <p className="store-root">{summary.root}</p> : null}
         </aside>
+        ) : (
+          <button
+            aria-label="Show Selected Record panel"
+            className="show-detail-panel"
+            onClick={() => setIsDetailPanelVisible(true)}
+            title="Show Selected Record panel"
+          >
+            <PanelRightOpen aria-hidden="true" size={18} />
+          </button>
+        )}
       </section>
     </main>
   );

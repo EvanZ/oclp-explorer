@@ -73,6 +73,23 @@ wait_for_listener() {
   exit 1
 }
 
+wait_for_api_health() {
+  local port="$1"
+  local label="$2"
+  local log_file="$3"
+  local health_url="http://127.0.0.1:${port}/api/health"
+
+  for _ in {1..150}; do
+    if curl -fsS "$health_url" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.2
+  done
+  echo "The $label service bound port $port but did not become healthy. Recent log output:"
+  tail -n 60 "$log_file" || true
+  exit 1
+}
+
 if [[ ! -d "$oclp_dir" ]]; then
   echo "OCLP store does not exist: $oclp_dir"
   echo "Set OCLP_DOGFOOD_DIR to a directory containing OCLP records."
@@ -107,6 +124,7 @@ launchctl submit -l "$api_label" -o "$api_log" -e "$api_log" -- \
   /usr/bin/env "PATH=$launch_path" "PYTHONPATH=$oclp_python_source" "$api_bin" \
   --oclp-dir "$oclp_dir" --port "$api_port"
 wait_for_listener "$api_port" "Cyclops API" "$api_log"
+wait_for_api_health "$api_port" "Cyclops API" "$api_log"
 
 launchctl submit -l "$frontend_label" -o "$frontend_log" -e "$frontend_log" -- \
   /usr/bin/env "PATH=$launch_path" "$npm_bin" --prefix "$explorer_root/apps/cyclops" run dev

@@ -134,10 +134,12 @@ The internal Python package is oclp_explorer; CYCLOPS is the UI name.
 - Focused three-hop lineage around a selected record.
 - Existing profile-bearing Artifacts, including dataset-snapshot manifests.
 
-For this slice, CYCLOPS maintains two rebuildable local DuckDB databases:
+In a typical local store, two DuckDB databases have distinct owners:
 
 - `<oclp-dir>/catalog.duckdb` is the generic OCLP resolver and Artifact-location
-  index. It loads and integrity-verifies canonical records.
+  index owned by the producer. CYCLOPS deliberately does **not** open it:
+  DuckDB cannot allow a producer writer and an external reader at the same
+  time. CYCLOPS projects the immutable canonical record files instead.
 - `<oclp-dir>/cyclops.duckdb` is CYCLOPS's navigation read model. Its
   `cyclops_runs`, `cyclops_run_members`, and `cyclops_run_artifacts` tables
   index root runs, their connected lineage groups, explicit Invocation
@@ -172,9 +174,8 @@ Then start the frontend:
     npm run dev
 
 Open <http://127.0.0.1:5175>. Vite proxies requests to the API on port 8002.
-Pass `--catalog-path path/to/catalog.duckdb` or
-`--run-index-path path/to/cyclops.duckdb` to keep either local index outside
-the OCLP record directory.
+Pass `--run-index-path path/to/cyclops.duckdb` to keep CYCLOPS's navigation
+read model outside the OCLP record directory.
 
 For the NBA dogfood checkout, use the local restart helper instead of managing
 two terminals:

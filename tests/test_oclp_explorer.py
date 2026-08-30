@@ -845,6 +845,34 @@ def test_cyclops_api_serializes_concurrent_catalog_loads(tmp_path: Path) -> None
     assert [response.status_code for response in responses] == [200, 200]
 
 
+def test_cyclops_does_not_lock_the_producer_catalog(tmp_path: Path) -> None:
+    root = tmp_path / "oclp"
+    artifact = Artifact(
+        id="urn:example:artifact:source",
+        media_type="application/octet-stream",
+        digest=Digest(value="a" * 64),
+        size=1,
+    )
+    _publish(root, artifact)
+    catalog_path = root / "catalog.duckdb"
+    with DuckdbCatalog(catalog_path) as producer:
+        producer.publish(artifact)
+
+    with TestClient(create_app(root)) as client:
+        assert client.get("/api/health").status_code == 200
+        # A long-lived Cyclops API must not hold DuckDB's mutually exclusive
+        # cross-process lock while a producer appends new OCLP records.
+        with DuckdbCatalog(catalog_path) as producer:
+            producer.publish(
+                Artifact(
+                    id="urn:example:artifact:new-output",
+                    media_type="application/octet-stream",
+                    digest=Digest(value="b" * 64),
+                    size=1,
+                )
+            )
+
+
 def test_cyclops_api_caches_a_snapshot_until_manual_refresh(tmp_path: Path) -> None:
     root = tmp_path / "oclp"
     _publish(

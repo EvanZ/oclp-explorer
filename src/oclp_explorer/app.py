@@ -9,7 +9,6 @@ from threading import Lock
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from oclp.catalog.duckdb import DuckdbCatalog
 
 from oclp_explorer.graph import OclpProjectGraph, load_project_graph
 from oclp_explorer.run_index import CyclopsRunIndex
@@ -18,17 +17,14 @@ from oclp_explorer.run_index import CyclopsRunIndex
 def create_app(
     oclp_dir: Path | str = Path("data/oclp"),
     *,
-    catalog_path: Path | str | None = None,
     run_index_path: Path | str | None = None,
 ) -> FastAPI:
     """Create a CYCLOPS API bound to one explicit local OCLP store."""
 
     root = Path(oclp_dir)
-    database = Path(catalog_path) if catalog_path is not None else root / "catalog.duckdb"
     run_index_database = (
         Path(run_index_path) if run_index_path is not None else root / "cyclops.duckdb"
     )
-    catalog: DuckdbCatalog | None = None
     run_index: CyclopsRunIndex | None = None
     cached_graph: OclpProjectGraph | None = None
     catalog_lock = Lock()
@@ -36,12 +32,13 @@ def create_app(
     def _rebuild_graph_locked() -> OclpProjectGraph:
         """Build the one immutable project snapshot served until manual refresh."""
 
-        nonlocal catalog, cached_graph, run_index
-        if catalog is None:
-            catalog = DuckdbCatalog(database)
+        nonlocal cached_graph, run_index
         if run_index is None:
             run_index = CyclopsRunIndex(run_index_database)
-        cached_graph = load_project_graph(root, catalog=catalog)
+        # The producer owns catalog.duckdb. DuckDB permits either a writer or
+        # readers from other processes, never both; CYCLOPS instead projects
+        # the canonical record files and keeps its read model separately.
+        cached_graph = load_project_graph(root)
         run_index.rebuild(cached_graph)
         return cached_graph
 
@@ -75,14 +72,11 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        nonlocal cached_graph, catalog, run_index
+        nonlocal cached_graph, run_index
         try:
             yield
         finally:
             with catalog_lock:
-                if catalog is not None:
-                    catalog.close()
-                    catalog = None
                 if run_index is not None:
                     run_index.close()
                     run_index = None
@@ -181,11 +175,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run CYCLOPS, the OCLP Project Explorer")
     parser.add_argument("--oclp-dir", type=Path, default=Path("data/oclp"))
     parser.add_argument(
-        "--catalog-path",
-        type=Path,
-        help="DuckDB catalog path (default: <oclp-dir>/catalog.duckdb)",
-    )
-    parser.add_argument(
         "--run-index-path",
         type=Path,
         help="CYCLOPS run-index path (default: <oclp-dir>/cyclops.duckdb)",
@@ -197,7 +186,6 @@ def main() -> None:
     uvicorn.run(
         create_app(
             arguments.oclp_dir,
-            catalog_path=arguments.catalog_path,
             run_index_path=arguments.run_index_path,
         ),
         host="127.0.0.1",

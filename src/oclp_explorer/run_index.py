@@ -37,20 +37,23 @@ class CyclopsRunIndex:
         self.close()
 
     def rebuild(self, graph: OclpProjectGraph) -> None:
-        """Replace the index with the current root-run and lineage hierarchy."""
+        """Replace the index with the current lifecycle-run projection."""
 
         runs = graph.runs_payload()["runs"]
+        inference_services = graph.inference_services_payload()
         run_rows: list[tuple[object, ...]] = []
         member_rows: list[tuple[object, ...]] = []
         artifact_rows: list[tuple[object, ...]] = []
+        run_lineages: dict[str, str] = {}
+        run_by_execution: dict[str, str] = {}
 
         for sort_order, run in enumerate(runs):
             root_digest = str(run["id"])
-            # A lineage can have several explicit orchestration roots when an
-            # Artifact handoff links independently started runs.  The stable
-            # lexical root digest is an implementation-only group key;
-            # the actual root Invocation IDs remain the public identities.
+            # A lineage can contain several independently started lifecycle
+            # runs joined by an Artifact handoff. This stable lexical key is
+            # implementation-only; the profile run ID remains public.
             lineage_id = min(graph.run_lineage_roots(root_digest))
+            run_lineages[root_digest] = lineage_id
             run_rows.append(
                 (
                     root_digest,
@@ -58,39 +61,41 @@ class CyclopsRunIndex:
                     str(run["record_id"]),
                     str(run["label"]),
                     json.dumps(run["timeline"]),
-                    int(run["invocation_count"]),
+                    int(run["execution_count"]),
                     int(run["artifact_count"]),
                     sort_order,
                 )
             )
-            invocation_digests = {
-                str(invocation["id"])
-                for invocation in run["invocations"]  # type: ignore[index]
+            execution_digests = {
+                str(execution["id"])
+                for execution in run["executions"]  # type: ignore[index]
             }
-            for invocation in run["invocations"]:  # type: ignore[index]
+            for member_order, execution in enumerate(run["executions"]):  # type: ignore[index]
+                run_by_execution[str(execution["id"])] = root_digest
                 member_rows.append(
                     (
                         root_digest,
-                        str(invocation["id"]),
-                        str(invocation["record_id"]),
-                        str(invocation["label"]),
-                        int(invocation["depth"]),
-                        str(invocation["status"]),
-                        json.dumps(invocation["diagnostic"])
-                        if invocation["diagnostic"] is not None
+                        str(execution["id"]),
+                        str(execution["record_id"]),
+                        str(execution["label"]),
+                        int(execution["depth"]),
+                        str(execution["status"]),
+                        json.dumps(execution["diagnostic"])
+                        if execution["diagnostic"] is not None
                         else None,
+                        member_order,
                     )
                 )
             run_graph = graph.graph_payload(view="run", run=root_digest)
             for edge in run_graph["edges"]:  # type: ignore[index]
-                if edge["relation"] == "consumes" and edge["target"] in invocation_digests:
-                    invocation_digest, artifact_digest, direction = (
+                if edge["relation"] == "consumes" and edge["target"] in execution_digests:
+                    execution_digest, artifact_digest, direction = (
                         edge["target"],
                         edge["source"],
                         "input",
                     )
-                elif edge["relation"] == "produces" and edge["source"] in invocation_digests:
-                    invocation_digest, artifact_digest, direction = (
+                elif edge["relation"] == "produces" and edge["source"] in execution_digests:
+                    execution_digest, artifact_digest, direction = (
                         edge["source"],
                         edge["target"],
                         "output",
@@ -99,11 +104,48 @@ class CyclopsRunIndex:
                     continue
                 if graph.records[artifact_digest].kind == "artifact":
                     artifact_rows.append(
-                        (root_digest, invocation_digest, artifact_digest, direction)
+                        (root_digest, execution_digest, artifact_digest, direction)
                     )
+
+        service_rows: list[tuple[object, ...]] = []
+        service_member_rows: list[tuple[object, ...]] = []
+        for service in inference_services:
+            execution_ids = [str(value) for value in service["execution_ids"]]  # type: ignore[index]
+            root_digests = {
+                run_by_execution[execution_id]
+                for execution_id in execution_ids
+                if execution_id in run_by_execution
+            }
+            lineage_ids = {run_lineages[root_digest] for root_digest in root_digests}
+            # A release-backed service belongs below one connected lineage. If
+            # malformed records span unrelated lineage components, retain the
+            # raw request runs rather than inventing a cross-lineage group.
+            if len(lineage_ids) != 1:
+                continue
+            service_id = str(service["id"])
+            service_rows.append(
+                (
+                    service_id,
+                    next(iter(lineage_ids)),
+                    str(service["release_digest"]),
+                    str(service["release_id"]),
+                    str(service["label"]),
+                    json.dumps(service["timeline"]),
+                    len(execution_ids),
+                )
+            )
+            for member_order, execution_id in enumerate(execution_ids):
+                root_digest = run_by_execution.get(execution_id)
+                if root_digest is None:
+                    continue
+                service_member_rows.append(
+                    (service_id, root_digest, execution_id, member_order)
+                )
 
         self._connection.execute("BEGIN TRANSACTION")
         try:
+            self._connection.execute("DELETE FROM cyclops_inference_service_members")
+            self._connection.execute("DELETE FROM cyclops_inference_services")
             self._connection.execute("DELETE FROM cyclops_run_artifacts")
             self._connection.execute("DELETE FROM cyclops_run_members")
             self._connection.execute("DELETE FROM cyclops_runs")
@@ -111,7 +153,7 @@ class CyclopsRunIndex:
                 self._connection.executemany(
                     """
                     INSERT INTO cyclops_runs
-                        (root_digest, lineage_id, record_id, label, timeline, invocation_count,
+                        (root_digest, lineage_id, record_id, label, timeline, execution_count,
                          artifact_count, sort_order)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
@@ -121,9 +163,9 @@ class CyclopsRunIndex:
                 self._connection.executemany(
                     """
                     INSERT INTO cyclops_run_members
-                        (root_digest, invocation_digest, record_id, label, depth,
-                         status, diagnostic)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                        (root_digest, execution_digest, record_id, label, depth,
+                         status, diagnostic, member_order)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     member_rows,
                 )
@@ -131,10 +173,29 @@ class CyclopsRunIndex:
                 self._connection.executemany(
                     """
                     INSERT INTO cyclops_run_artifacts
-                        (root_digest, invocation_digest, artifact_digest, direction)
+                        (root_digest, execution_digest, artifact_digest, direction)
                     VALUES (?, ?, ?, ?)
                     """,
                     artifact_rows,
+                )
+            if service_rows:
+                self._connection.executemany(
+                    """
+                    INSERT INTO cyclops_inference_services
+                        (service_id, lineage_id, release_digest, release_id, label,
+                         timeline, request_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    service_rows,
+                )
+            if service_member_rows:
+                self._connection.executemany(
+                    """
+                    INSERT INTO cyclops_inference_service_members
+                        (service_id, root_digest, execution_digest, member_order)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    service_member_rows,
                 )
         except Exception:
             self._connection.execute("ROLLBACK")
@@ -146,17 +207,17 @@ class CyclopsRunIndex:
         """Return the API tree model straight from the persistent read model.
 
         ``runs`` remains available for small consumers, while ``lineages`` is
-        the navigation projection: a connected group of one or more root runs
-        joined by explicit produced-and-consumed Artifact handoffs.
+        the navigation projection: a connected group of one or more lifecycle
+        runs joined by explicit produced-and-consumed Artifact handoffs.
         """
 
         members_by_run: dict[str, list[dict[str, object]]] = {}
         for row in self._connection.execute(
             """
-            SELECT root_digest, invocation_digest, record_id, label, depth,
+            SELECT root_digest, execution_digest, record_id, label, depth,
                    status, diagnostic
             FROM cyclops_run_members
-            ORDER BY root_digest, depth, label, record_id
+            ORDER BY root_digest, member_order, record_id
             """
         ).fetchall():
             members_by_run.setdefault(row[0], []).append(
@@ -174,50 +235,104 @@ class CyclopsRunIndex:
         for row in self._connection.execute(
             """
             SELECT root_digest, COALESCE(lineage_id, root_digest), record_id, label,
-                   timeline, invocation_count, artifact_count
+                   timeline, execution_count, artifact_count
             FROM cyclops_runs
             ORDER BY sort_order
             """
         ).fetchall():
             members = members_by_run.get(row[0], [])
-            status_members = [member for member in members if member["depth"] > 0]
-            if not status_members:
-                status_members = members
+            status_members = members
             run = {
                 "id": row[0],
                 "record_id": row[2],
                 "label": row[3],
                 "timeline": json.loads(row[4]),
-                "invocation_count": row[5],
+                "execution_count": row[5],
                 "artifact_count": row[6],
                 "status_counts": dict(
-                    sorted(
-                        Counter(str(member["status"]) for member in status_members).items()
-                    )
+                    sorted(Counter(str(member["status"]) for member in status_members).items())
                 ),
-                "invocations": members,
+                "executions": members,
             }
             runs.append(run)
             lineages_by_id.setdefault(str(row[1]), []).append(run)
 
-        lineages = [
-            {
-                "id": lineage_id,
-                "label": _lineage_label(lineage_runs),
-                "root_count": len(lineage_runs),
-                "invocation_count": sum(
-                    int(run["invocation_count"]) for run in lineage_runs
+        service_requests: dict[str, list[dict[str, object]]] = {}
+        service_run_ids: dict[str, set[str]] = {}
+        for row in self._connection.execute(
+            """
+            SELECT service_id, root_digest, execution_digest
+            FROM cyclops_inference_service_members
+            ORDER BY service_id, member_order
+            """
+        ).fetchall():
+            execution = next(
+                (
+                    member
+                    for member in members_by_run.get(str(row[1]), [])
+                    if member["id"] == row[2]
                 ),
-                "artifact_count": sum(int(run["artifact_count"]) for run in lineage_runs),
-                "status_counts": dict(
-                    sorted(
-                        _combined_status_counts(lineage_runs).items()
-                    )
-                ),
-                "runs": lineage_runs,
+                None,
+            )
+            if execution is None:
+                continue
+            service_requests.setdefault(str(row[0]), []).append(
+                {**execution, "run_id": row[1]}
+            )
+            service_run_ids.setdefault(str(row[0]), set()).add(str(row[1]))
+
+        services_by_lineage: dict[str, list[dict[str, object]]] = {}
+        for row in self._connection.execute(
+            """
+            SELECT service_id, lineage_id, release_digest, release_id, label,
+                   timeline, request_count
+            FROM cyclops_inference_services
+            ORDER BY label, service_id
+            """
+        ).fetchall():
+            requests = service_requests.get(str(row[0]), [])
+            services_by_lineage.setdefault(str(row[1]), []).append(
+                {
+                    "id": row[0],
+                    "release_digest": row[2],
+                    "release_id": row[3],
+                    "label": row[4],
+                    "timeline": json.loads(row[5]),
+                    "request_count": row[6],
+                    "status_counts": dict(
+                        sorted(Counter(str(request["status"]) for request in requests).items())
+                    ),
+                    "requests": requests,
+                }
+            )
+
+        lineages = []
+        for lineage_id, lineage_runs in lineages_by_id.items():
+            services = services_by_lineage.get(lineage_id, [])
+            service_run_ids_for_lineage = {
+                run_id
+                for service in services
+                for run_id in service_run_ids.get(str(service["id"]), set())
             }
-            for lineage_id, lineage_runs in lineages_by_id.items()
-        ]
+            presentation_runs = [
+                run for run in lineage_runs if str(run["id"]) not in service_run_ids_for_lineage
+            ]
+            lineages.append(
+                {
+                    "id": lineage_id,
+                    "label": _lineage_label(presentation_runs or lineage_runs),
+                    "root_count": len(presentation_runs),
+                    "execution_count": sum(
+                        int(run["execution_count"]) for run in lineage_runs
+                    ),
+                    "artifact_count": sum(int(run["artifact_count"]) for run in lineage_runs),
+                    "status_counts": dict(
+                        sorted(_combined_status_counts(lineage_runs).items())
+                    ),
+                    "runs": presentation_runs,
+                    "inference_services": services,
+                }
+            )
         return {"runs": runs, "lineages": lineages}
 
     def summary(self) -> dict[str, int]:
@@ -233,6 +348,14 @@ class CyclopsRunIndex:
         return int(self._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
     def _initialize(self) -> None:
+        # This is a rebuildable projection, not an OCLP store.  Dropping the
+        # former Invocation-named layout is the safest migration: every API
+        # process repopulates it from immutable Computation/Execution records.
+        self._connection.execute("DROP TABLE IF EXISTS cyclops_run_artifacts")
+        self._connection.execute("DROP TABLE IF EXISTS cyclops_run_members")
+        self._connection.execute("DROP TABLE IF EXISTS cyclops_runs")
+        self._connection.execute("DROP TABLE IF EXISTS cyclops_inference_service_members")
+        self._connection.execute("DROP TABLE IF EXISTS cyclops_inference_services")
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS cyclops_runs (
@@ -241,46 +364,59 @@ class CyclopsRunIndex:
                 record_id VARCHAR NOT NULL,
                 label VARCHAR NOT NULL,
                 timeline VARCHAR,
-                invocation_count INTEGER NOT NULL,
+                execution_count INTEGER NOT NULL,
                 artifact_count INTEGER NOT NULL,
                 sort_order INTEGER NOT NULL
             )
             """
         )
         self._connection.execute(
-            "ALTER TABLE cyclops_runs ADD COLUMN IF NOT EXISTS timeline VARCHAR"
+            """
+            CREATE TABLE IF NOT EXISTS cyclops_inference_services (
+                service_id VARCHAR PRIMARY KEY,
+                lineage_id VARCHAR NOT NULL,
+                release_digest VARCHAR NOT NULL,
+                release_id VARCHAR NOT NULL,
+                label VARCHAR NOT NULL,
+                timeline VARCHAR,
+                request_count INTEGER NOT NULL
+            )
+            """
         )
         self._connection.execute(
-            "ALTER TABLE cyclops_runs ADD COLUMN IF NOT EXISTS lineage_id VARCHAR"
+            """
+            CREATE TABLE IF NOT EXISTS cyclops_inference_service_members (
+                service_id VARCHAR NOT NULL,
+                root_digest VARCHAR NOT NULL,
+                execution_digest VARCHAR NOT NULL,
+                member_order INTEGER NOT NULL,
+                PRIMARY KEY (service_id, execution_digest)
+            )
+            """
         )
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS cyclops_run_members (
                 root_digest VARCHAR NOT NULL,
-                invocation_digest VARCHAR NOT NULL,
+                execution_digest VARCHAR NOT NULL,
                 record_id VARCHAR NOT NULL,
                 label VARCHAR NOT NULL,
                 depth INTEGER NOT NULL,
                 status VARCHAR,
                 diagnostic VARCHAR,
-                PRIMARY KEY (root_digest, invocation_digest)
+                member_order INTEGER NOT NULL,
+                PRIMARY KEY (root_digest, execution_digest)
             )
             """
-        )
-        self._connection.execute(
-            "ALTER TABLE cyclops_run_members ADD COLUMN IF NOT EXISTS status VARCHAR"
-        )
-        self._connection.execute(
-            "ALTER TABLE cyclops_run_members ADD COLUMN IF NOT EXISTS diagnostic VARCHAR"
         )
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS cyclops_run_artifacts (
                 root_digest VARCHAR NOT NULL,
-                invocation_digest VARCHAR NOT NULL,
+                execution_digest VARCHAR NOT NULL,
                 artifact_digest VARCHAR NOT NULL,
                 direction VARCHAR NOT NULL,
-                PRIMARY KEY (root_digest, invocation_digest, artifact_digest, direction)
+                PRIMARY KEY (root_digest, execution_digest, artifact_digest, direction)
             )
             """
         )
@@ -299,17 +435,17 @@ def _decode_diagnostic(value: object) -> dict[str, object] | None:
 
 
 def _lineage_label(runs: list[dict[str, object]]) -> str:
-    """Give a connected root-run group a concise, non-invented display name."""
+    """Give a connected lifecycle-run group a concise display name."""
 
     if not runs:
         return "Empty lineage"
     if len(runs) == 1:
         return str(runs[0]["label"])
-    return "Connected root runs"
+    return "Connected lifecycle runs"
 
 
 def _combined_status_counts(runs: list[dict[str, object]]) -> Counter[str]:
-    """Add root-run status summaries without turning counts into fake events."""
+    """Add lifecycle-run status summaries without turning counts into fake events."""
 
     counts: Counter[str] = Counter()
     for run in runs:

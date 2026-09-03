@@ -1,907 +1,608 @@
-"""Contract tests for the generic CYCLOPS OCLP graph projection and API."""
+"""Tests for CYCLOPS's Computation/Execution projections."""
 
 from __future__ import annotations
 
-import hashlib
-from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
 
-import duckdb
 from fastapi.testclient import TestClient
-from oclp import canonical_json_bytes, record_digest
-from oclp.catalog.duckdb import DuckdbCatalog
-from oclp.models import (
-    Artifact,
-    ArtifactSet,
-    ArtifactSetMember,
-    ComputationDefinition,
-    Diagnostic,
-    Digest,
-    Evidence,
-    Implementation,
-    Invocation,
-    LifecycleEvent,
-    RecordReference,
-)
-from oclp.profiles import (
-    DATASET_SNAPSHOT_PROFILE,
-    DATASET_SNAPSHOT_PROFILE_VERSION,
-    DatasetSnapshotBinding,
-    DatasetSnapshotManifest,
-    DatasetSnapshotPartition,
-)
+from oclp import ArtifactSet, ArtifactSetMember, Event, Evidence, Execution, evidence
+from oclp.computations import computation, computation_record
+from oclp.models import GitSource, Implementation, RecordReference
+from oclp.publishing import LocalArtifactPublisher
 
 from oclp_explorer.app import create_app
-from oclp_explorer.graph import _compact_label, load_project_graph
+from oclp_explorer.graph import load_project_graph
 from oclp_explorer.run_index import CyclopsRunIndex
 
 
-def test_project_graph_traverses_core_bindings_without_domain_imports(tmp_path: Path) -> None:
-    root = tmp_path / "oclp"
-    source = _publish(
-        root,
-        Artifact(
-            id="urn:example:artifact:source",
+@computation(id="urn:example:computation:prepare", name="Prepare features")
+def _prepare() -> None: ...
+
+
+@evidence(name="Release check")
+def _release_check(model: object) -> str:
+    return "pass"
+
+
+@computation(
+    id="urn:example:computation:train",
+    name="Train model",
+    requires=(_release_check,),
+)
+def _train() -> None: ...
+
+
+def _publisher(root: Path) -> LocalArtifactPublisher:
+    return LocalArtifactPublisher(
+        catalog_path=root / "catalog.duckdb",
+        record_root=root,
+        payload_root=root / "payload",
+    )
+
+
+def _fixture_store(root: Path) -> dict[str, RecordReference]:
+    """Publish a parent/child execution tree with direct data handoffs."""
+
+    now = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
+    with _publisher(root) as publisher:
+        source = publisher.json_artifact(
+            artifact_id="urn:example:artifact:source",
             name="Source data",
-            media_type="text/plain",
-            digest=Digest(value="a" * 64),
-            size=1,
-        ),
-    )
-    definition = _publish(
-        root,
-        ComputationDefinition(
-            id="urn:example:definition:transform",
-            name="Transform",
-            implementation=Implementation(
-                kind="other",
-                locator="example:transform",
-                artifact=source,
-                source={"kind": "opaque", "reason": "test fixture"},
-            ),
-        ),
-    )
-    output = _publish(
-        root,
-        Artifact(
-            id="urn:example:artifact:output",
-            name="Transformed output",
-            media_type="text/plain",
-            digest=Digest(value="b" * 64),
-            size=1,
-            created_at=datetime(2026, 8, 22, tzinfo=UTC),
-        ),
-    )
-    release = _publish(
-        root,
-        ArtifactSet(
-            id="urn:example:artifact-set:release",
-            name="Release",
-            members=(ArtifactSetMember(name="result", artifact=output),),
-            created_at=datetime(2026, 8, 22, tzinfo=UTC),
-        ),
-    )
-    invocation = _publish(
-        root,
-        Invocation(
-            id="urn:example:invocation:transform",
-            name="Transform input",
-            definition=definition,
-            inputs={"source": (source,)},
-            outputs={"result": (output,), "release": (release,)},
-        ),
-    )
-    evidence = _publish(
-        root,
-        Evidence(
-            id="urn:example:evidence:output",
-            name="Output evidence",
-            subject=invocation,
-            contract={"id": "urn:example:contract:output", "version": "1"},
-            outcome="pass",
-            observed_at=datetime(2026, 8, 22, tzinfo=UTC),
-        ),
-    )
-    event = _publish(
-        root,
-        LifecycleEvent(
-            id="urn:example:event:outputs",
-            name="Outputs published",
-            invocation=invocation,
-            event_type="outputs-published",
-            occurred_at=datetime(2026, 8, 22, tzinfo=UTC),
-            sequence=0,
-            data={
-                "outputs": {"result": output.model_dump(mode="json")},
-                "evidence": evidence.model_dump(mode="json"),
-            },
-        ),
-    )
-    input_bundle = _publish(
-        root,
-        ArtifactSet(
-            id="urn:example:artifact-set:input-bundle",
-            name="Input bundle from another run",
-            members=(ArtifactSetMember(name="source", artifact=source),),
-        ),
-    )
-
-    with DuckdbCatalog(tmp_path / "catalog.duckdb") as catalog:
-        graph = load_project_graph(root, catalog=catalog)
-        assert catalog.resolve(invocation).id == invocation.id
-
-    invocation_node = next(node for node in graph.nodes if node["kind"] == "invocation")
-    assert invocation_node["label"].splitlines()[:2] == [
-        "invocation",
-        "Transform input",
-    ]
-    assert all(node["label"].splitlines()[0] == node["kind"] for node in graph.nodes)
-
-    assert graph.summary()["counts"] == {
-        "artifact": 2,
-        "artifact_set": 2,
-        "definition": 1,
-        "event": 1,
-        "evidence": 1,
-        "invocation": 1,
-    }
-    assert {edge["relation"] for edge in graph.reference_edges} == {
-        "contains",
-        "definition",
-        "evidence-subject",
-        "event-invocation",
-        "event-reference",
-        "implementation",
-        "input",
-        "output",
-    }
-    assert {edge["relation"] for edge in graph.derivation_edges} == {
-        "consumes",
-        "produces",
-    }
-    assert {edge["label"] for edge in graph.derivation_edges} == {
-        "input: source",
-        "output: result",
-        "output: release",
-    }
-    assert {
-        node["label"]
-        for node in graph.nodes
-        if node["id"] in {source.digest.value, output.digest.value}
-    } == {"artifact\nSource data", "artifact\nTransformed output"}
-    derivation = graph.graph_payload()
-    assert {node["id"] for node in derivation["nodes"]} == {
-        source.digest.value,
-        invocation.digest.value,
-        output.digest.value,
-        release.digest.value,
-    }
-    assert input_bundle.digest.value not in {node["id"] for node in derivation["nodes"]}
-    assert derivation["edges"] == list(graph.derivation_edges)
-    assert derivation["collection_edges"][0]["label"] == "result"
-    provenance = graph.graph_payload(view="provenance")
-    provenance_nodes = {node["id"]: node for node in provenance["nodes"]}
-    assert set(provenance_nodes) == {
-        source.digest.value,
-        definition.digest.value,
-        invocation.digest.value,
-        output.digest.value,
-        release.digest.value,
-        *[
-            record_digest(record).value
-            for record in graph.records.values()
-            if record.kind in {"event", "evidence"}
-        ],
-    }
-    assert provenance_nodes[source.digest.value]["layer"] == "data"
-    assert provenance_nodes[definition.digest.value]["layer"] == "provenance"
-    assert provenance_nodes[definition.digest.value]["label"] == "definition\nTransform"
-    assert provenance_nodes[event.digest.value]["timeline_at"] == "2026-08-22T00:00:00+00:00"
-    assert provenance_nodes[event.digest.value]["timeline_sequence"] == "0"
-    assert provenance_nodes[evidence.digest.value]["timeline_at"] == "2026-08-22T00:00:00+00:00"
-    assert provenance_nodes[evidence.digest.value]["timeline_sequence"] == "0.5"
-    assert {edge["relation"] for edge in provenance["edges"]} == {
-        "consumes",
-        "definition",
-        "evidence-subject",
-        "event-invocation",
-        "implementation",
-        "produces",
-    }
-    assert not {edge["relation"] for edge in provenance["edges"]} & {
-        "input",
-        "output",
-        "contains",
-        "event-reference",
-    }
-    timeline_nodes = {
-        node["id"]: node for node in graph.graph_payload(view="timeline")["nodes"]
-    }
-    assert timeline_nodes[evidence.digest.value]["timeline_sequence"] == "0.5"
-    assert timeline_nodes[output.digest.value]["timeline_at"] == "2026-08-22T00:00:00+00:00"
-    assert timeline_nodes[release.digest.value]["timeline_at"] == "2026-08-22T00:00:00+00:00"
-    assert timeline_nodes[source.digest.value]["timeline_role"] == "input"
-    assert "timeline_at" not in timeline_nodes[source.digest.value]
-    timeline_edges = graph.graph_payload(view="timeline")["edges"]
-    assert {
-        (edge["source"], edge["target"], edge["relation"])
-        for edge in timeline_edges
-    } == {
-        (source.digest.value, invocation.digest.value, "consumes"),
-        (invocation.digest.value, output.digest.value, "produces"),
-        (invocation.digest.value, release.digest.value, "produces"),
-    }
-    computations = graph.computations_payload()["computations"]
-    assert len(computations) == 1
-    assert computations[0]["invocation_count"] == 1
-    assert computations[0]["label"] == "Transform input · 1 invocation"
-    invocation_node = next(node for node in graph.nodes if node["id"] == invocation.digest.value)
-    assert invocation_node["label"] == "invocation\nTransform input"
-    focused = graph.focused_payload(invocation.digest.value, depth=1)
-    assert invocation.digest.value in {node["id"] for node in focused["nodes"]}
-
-
-def test_project_graph_accepts_an_artifact_set_invocation_input(tmp_path: Path) -> None:
-    root = tmp_path / "oclp"
-    source = _publish(
-        root,
-        Artifact(
-            id="urn:example:artifact:model-weights",
-            name="Model weights",
-            media_type="application/octet-stream",
-            digest=Digest(value="c" * 64),
-            size=1,
-        ),
-    )
-    model_package = _publish(
-        root,
-        ArtifactSet(
-            id="urn:example:artifact-set:model-package",
+            relative_path="source.json",
+            value={"rows": 12},
+            created_at=now,
+        ).reference
+        features = publisher.json_artifact(
+            artifact_id="urn:example:artifact:features",
+            name="Feature table",
+            relative_path="features.json",
+            value={"rows": 10},
+            created_at=now + timedelta(seconds=10),
+        ).reference
+        model = publisher.json_artifact(
+            artifact_id="urn:example:artifact:model",
             name="Model package",
-            members=(ArtifactSetMember(name="weights", artifact=source),),
-        ),
-    )
-    definition = _publish(
-        root,
-        ComputationDefinition(
-            id="urn:example:definition:evaluate-model",
-            implementation=Implementation(
-                kind="other",
-                locator="example:evaluate-model",
-                source={"kind": "opaque", "reason": "test fixture"},
-            ),
-        ),
-    )
-    response = _publish(
-        root,
-        Artifact(
-            id="urn:example:artifact:prediction",
-            name="Prediction response",
-            media_type="application/json",
-            digest=Digest(value="d" * 64),
-            size=1,
-        ),
-    )
-    invocation = _publish(
-        root,
-        Invocation(
-            id="urn:example:invocation:evaluate-model",
-            definition=definition,
-            inputs={"model_package": (model_package,)},
-            outputs={"response": (response,)},
-        ),
-    )
-
-    graph = load_project_graph(root)
-
-    assert {
-        (edge["source"], edge["target"], edge["relation"])
-        for edge in graph.derivation_edges
-    } == {
-        (model_package.digest.value, invocation.digest.value, "consumes"),
-        (invocation.digest.value, response.digest.value, "produces"),
+            relative_path="model.json",
+            value={"model": "linear"},
+            created_at=now + timedelta(seconds=20),
+        ).reference
+        release = publisher.publish(
+            ArtifactSet(
+                id="urn:example:artifact-set:model-release",
+                name="Candidate release",
+                created_at=now + timedelta(seconds=21),
+                members=(ArtifactSetMember(name="model", artifact=model),),
+            )
+        )
+        source_basis = GitSource(repository="https://example.test/project.git", commit="a" * 40)
+        prepare = publisher.publish(computation_record(_prepare, source=source_basis))
+        train = publisher.publish(computation_record(_train, source=source_basis))
+        root_execution = publisher.publish(
+            Execution(
+                id="urn:example:execution:prepare:one",
+                name="Prepare features for August",
+                profiles={"lifecycle": {"version": "0.2.0-draft"}},
+                computation=prepare,
+                inputs={"source": (source,)},
+                outputs={"features": (features,)},
+            )
+        )
+        child_execution = publisher.publish(
+            Execution(
+                id="urn:example:execution:train:one",
+                name="Train August candidate",
+                profiles={"lifecycle": {"version": "0.2.0-draft"}},
+                computation=train,
+                parent_execution=root_execution,
+                inputs={"features": (features,)},
+                outputs={"model": (model,), "release": (release,)},
+            )
+        )
+        for execution, offset in ((root_execution, 0), (child_execution, 10)):
+            started_at = now + timedelta(seconds=offset)
+            publisher.publish(
+                Event(
+                    id=f"urn:example:event:{execution.id.rsplit(':', 1)[-1]}:started",
+                    execution=execution,
+                    event_type="execution-started",
+                    occurred_at=started_at,
+                    sequence=0,
+                )
+            )
+            publisher.publish(
+                Event(
+                    id=f"urn:example:event:{execution.id.rsplit(':', 1)[-1]}:terminal",
+                    execution=execution,
+                    event_type="execution-terminal",
+                    occurred_at=started_at + timedelta(seconds=1),
+                    sequence=1,
+                    status="succeeded",
+                )
+            )
+        evidence = publisher.publish(
+            Evidence(
+                id="urn:example:evidence:release-check",
+                name="Release check",
+                subject=child_execution,
+                evaluator=Implementation(
+                    kind="python-callable",
+                    locator=f"{__name__}._release_check",
+                    source=source_basis,
+                ),
+                outcome="pass",
+                observed_at=now + timedelta(seconds=22),
+            )
+        )
+    return {
+        "source": source,
+        "features": features,
+        "model": model,
+        "release": release,
+        "root_execution": root_execution,
+        "child_execution": child_execution,
+        "evidence": evidence,
     }
-    payload = graph.graph_payload()
-    assert model_package.digest.value in {node["id"] for node in payload["nodes"]}
-    assert source.digest.value not in {node["id"] for node in payload["nodes"]}
-    assert {node["id"] for node in payload["collection_nodes"]} == {source.digest.value}
-    assert {
-        (edge["source"], edge["target"], edge["relation"])
-        for edge in payload["collection_edges"]
-    } == {(model_package.digest.value, source.digest.value, "contains")}
 
 
-def test_dataset_snapshot_input_groups_exact_partition_artifacts(tmp_path: Path) -> None:
+def test_data_dag_is_artifact_execution_artifact_and_uses_new_kinds(tmp_path: Path) -> None:
     root = tmp_path / "oclp"
-    first_part = _publish(
-        root,
-        Artifact(
-            id="urn:example:artifact:dataset:part-00000",
-            name="Part 00000",
-            media_type="application/vnd.apache.parquet",
-            digest=Digest(value="a" * 64),
-            size=1,
-        ),
-    )
-    second_part = _publish(
-        root,
-        Artifact(
-            id="urn:example:artifact:dataset:part-00001",
-            name="Part 00001",
-            media_type="application/vnd.apache.parquet",
-            digest=Digest(value="b" * 64),
-            size=1,
-        ),
-    )
-    manifest = DatasetSnapshotManifest(
-        dataset_id="urn:example:dataset:lineup-stints:2025-26:regular",
-        data_format="application/vnd.apache.parquet",
-        partitions=(
-            DatasetSnapshotPartition(name="part-00000.parquet", artifact=first_part),
-            DatasetSnapshotPartition(name="part-00001.parquet", artifact=second_part),
-        ),
-    )
-    content = canonical_json_bytes(manifest)
-    payload_digest = Digest(value=hashlib.sha256(content).hexdigest())
-    payload_path = (
-        root
-        / "payload"
-        / payload_digest.value[:2]
-        / (payload_digest.value + ".dataset-snapshot.json")
-    )
-    payload_path.parent.mkdir(parents=True, exist_ok=True)
-    payload_path.write_bytes(content)
-    snapshot = _publish(
-        root,
-        Artifact(
-            id="urn:example:artifact:dataset-snapshot:lineup-stints:2025-26:regular",
-            name="Lineup stints dataset snapshot - 2025-26 regular",
-            media_type="application/vnd.oclp.dataset-snapshot-manifest+json",
-            digest=payload_digest,
-            size=len(content),
-            locations=(payload_path.resolve().as_uri(),),
-            schema_uri="urn:oclp:profile:dataset-snapshot:0.1.0-draft",
-            profiles={
-                DATASET_SNAPSHOT_PROFILE: DatasetSnapshotBinding(
-                    version=DATASET_SNAPSHOT_PROFILE_VERSION,
-                ).model_dump(mode="json")
-            },
-        ),
-    )
-    definition = _publish(
-        root,
-        ComputationDefinition(
-            id="urn:example:definition:train",
-            implementation=Implementation(
-                kind="other",
-                locator="example:train",
-                source={"kind": "opaque", "reason": "test fixture"},
-            ),
-        ),
-    )
-    invocation = _publish(
-        root,
-        Invocation(
-            id="urn:example:invocation:train",
-            definition=definition,
-            inputs={"lineup_stints_snapshot": (snapshot,)},
-        ),
-    )
-
+    refs = _fixture_store(root)
     graph = load_project_graph(root)
-    payload = graph.graph_payload(view="derivation", invocation=invocation.digest.value)
 
-    nodes = {node["id"]: node for node in payload["nodes"]}
-    assert nodes[snapshot.digest.value]["collection_kind"] == "dataset-snapshot"
-    assert not {first_part.digest.value, second_part.digest.value} & set(nodes)
-    assert {node["id"] for node in payload["collection_nodes"]} == {
-        first_part.digest.value,
-        second_part.digest.value,
+    nodes = {node["id"]: node for node in graph.nodes}
+    assert {node["kind"] for node in nodes.values()} == {
+        "artifact",
+        "artifact_set",
+        "computation",
+        "execution",
+        "evidence",
+        "event",
     }
+    execution = refs["child_execution"].digest.value
+    features = refs["features"].digest.value
+    model = refs["model"].digest.value
+    dag = graph.graph_payload(view="derivation", execution=execution)
+    edges = {(edge["source"], edge["target"], edge["relation"]) for edge in dag["edges"]}
+    assert (features, execution, "consumes") in edges
+    assert (execution, model, "produces") in edges
+    assert nodes[features]["media_type"] == "application/json"
+    assert nodes[features]["label"].split("\n", maxsplit=1)[0] == "application/json"
+    assert nodes[refs["evidence"].digest.value]["outcome"] == "pass"
     assert {
-        (edge["source"], edge["target"], edge["relation"]) for edge in payload["collection_edges"]
-    } == {
-        (snapshot.digest.value, first_part.digest.value, "dataset-partition"),
-        (snapshot.digest.value, second_part.digest.value, "dataset-partition"),
-    }
-
-
-def test_provenance_view_connects_parent_and_child_invocations(tmp_path: Path) -> None:
-    root = tmp_path / "oclp"
-    definition = _publish(
-        root,
-        ComputationDefinition(
-            id="urn:example:definition:flow",
-            implementation=Implementation(
-                kind="other",
-                locator="example:flow",
-                source={"kind": "opaque", "reason": "test fixture"},
-            ),
-        ),
-    )
-    parent = _publish(
-        root,
-        Invocation(
-            id="urn:example:invocation:season-run",
-            definition=definition,
-            profiles={"lifecycle": {"version": "0.1.0-draft"}},
-        ),
-    )
-    child = _publish(
-        root,
-        Invocation(
-            id="urn:example:invocation:game-task",
-            definition=definition,
-            parent_invocation=RecordReference(id=parent.id),
-            profiles={"lifecycle": {"version": "0.1.0-draft"}},
-        ),
-    )
-    parent_requested = _publish(
-        root,
-        LifecycleEvent(
-            id="urn:example:event:season-requested",
-            invocation=parent,
-            event_type="invocation-requested",
-            occurred_at=datetime(2026, 8, 23, tzinfo=UTC),
-            sequence=0,
-            data={"run_id": "season-2026-08-23"},
-        ),
-    )
-    child_requested = _publish(
-        root,
-        LifecycleEvent(
-            id="urn:example:event:game-requested",
-            invocation=child,
-            event_type="invocation-requested",
-            occurred_at=datetime(2026, 8, 23, 0, 30, tzinfo=UTC),
-            sequence=0,
-        ),
-    )
-    child_started = _publish(
-        root,
-        LifecycleEvent(
-            id="urn:example:event:game-started",
-            invocation=child,
-            event_type="attempt-started",
-            occurred_at=datetime(2026, 8, 23, 0, 30, 1, tzinfo=UTC),
-            sequence=1,
-            attempt_id="game-attempt-1",
-        ),
-    )
-    child_failed = _publish(
-        root,
-        LifecycleEvent(
-            id="urn:example:event:game-failed",
-            invocation=child,
-            event_type="invocation-terminal",
-            occurred_at=datetime(2026, 8, 23, 1, tzinfo=UTC),
-            sequence=2,
-            status="failed",
-            diagnostic=Diagnostic(
-                code="process:preflight:ValueError",
-                message="The terminal Event diagnostic, not Evidence details",
-                stage="preflight",
-            ),
-        ),
-    )
-    evidence = _publish(
-        root,
-        Evidence(
-            id="urn:example:evidence:game-failed",
-            subject=child,
-            contract={"id": "urn:example:contract:game-quality", "version": "1"},
-            outcome="error",
-            observed_at=datetime(2026, 8, 23, 1, tzinfo=UTC),
-            details={"error_message": "Application-specific Evidence detail"},
-        ),
-    )
-
-    graph = load_project_graph(root)
-    runs = graph.runs_payload()["runs"]
-    assert runs == [
-        {
-            "id": parent.digest.value,
-            "record_id": parent.id,
-            "label": "example:flow · season-2026-08-23",
-            "timeline": {
-                "kind": "lifecycle",
-                "requested_at": "2026-08-23T00:00:00+00:00",
-                "started_at": None,
-                "completed_at": None,
-                "first_event_at": "2026-08-23T00:00:00+00:00",
-                "last_event_at": "2026-08-23T00:00:00+00:00",
-            },
-            "invocation_count": 2,
-            "artifact_count": 0,
-            "status_counts": {"failed": 1},
-            "invocations": [
-                {
-                    "id": parent.digest.value,
-                    "record_id": parent.id,
-                    "label": "example:flow",
-                    "depth": 0,
-                    "status": "incomplete",
-                    "diagnostic": None,
-                },
-                {
-                    "id": child.digest.value,
-                    "record_id": child.id,
-                    "label": "example:flow",
-                    "depth": 1,
-                    "status": "failed",
-                    "diagnostic": {
-                        "code": "process:preflight:ValueError",
-                        "message": "The terminal Event diagnostic, not Evidence details",
-                        "stage": "preflight",
-                    },
-                },
-            ],
-        }
-    ]
-    with CyclopsRunIndex(tmp_path / "cyclops.duckdb") as run_index:
-        run_index.rebuild(graph)
-        assert run_index.runs_payload()["runs"] == runs
-        assert run_index.summary() == {
-            "run_count": 1,
-            "run_member_count": 2,
-            "run_artifact_count": 0,
-        }
-    with TestClient(create_app(root)) as client:
-        assert client.get("/api/runs").json()["runs"] == runs
-        assert client.get(
-            f"/api/graph?view=timeline&run={parent.digest.value}"
-        ).json()["view"] == "timeline"
-        assert client.get("/api/health").json()["run_index"] == {
-            "run_count": 1,
-            "run_member_count": 2,
-            "run_artifact_count": 0,
-        }
-    run_graph = graph.graph_payload(view="run", run=parent.digest.value)
-    assert {node["id"] for node in run_graph["nodes"]} == {
-        parent.digest.value,
-        child.digest.value,
-    }
-    assert {(edge["source"], edge["target"], edge["relation"]) for edge in run_graph["edges"]} == {
-        (parent.digest.value, child.digest.value, "orchestrates")
-    }
-    child_data = graph.graph_payload(
-        view="derivation",
-        run=parent.digest.value,
-        invocation=child.digest.value,
-    )
-    assert {node["id"] for node in child_data["nodes"]} == {child.digest.value}
-    child_provenance = graph.graph_payload(
-        view="provenance",
-        run=parent.digest.value,
-        invocation=child.digest.value,
-    )
-    assert parent.digest.value not in {node["id"] for node in child_provenance["nodes"]}
-    timeline = graph.graph_payload(view="timeline", run=parent.digest.value)
-    timeline_nodes = {node["id"]: node for node in timeline["nodes"]}
-    assert set(timeline_nodes) == {
-        parent.digest.value,
-        child.digest.value,
-        parent_requested.digest.value,
-        child_requested.digest.value,
-        child_started.digest.value,
-        child_failed.digest.value,
-        evidence.digest.value,
-    }
-    assert timeline_nodes[parent.digest.value]["timeline_lane"] == parent.digest.value
-    assert timeline_nodes[parent.digest.value]["timeline_depth"] == "0"
-    assert timeline_nodes[child.digest.value]["timeline_lane"] == child.digest.value
-    assert timeline_nodes[child_requested.digest.value]["timeline_lane"] == child.digest.value
-    assert timeline_nodes[child_started.digest.value]["timeline_sequence"] == "1"
-    assert timeline_nodes[evidence.digest.value]["timeline_at"] == "2026-08-23T01:00:00+00:00"
-    assert {(edge["source"], edge["target"], edge["relation"]) for edge in timeline["edges"]} == {
-        (parent.digest.value, child.digest.value, "orchestrates")
-    }
-    parent_component = next(
-        component_id
-        for component_id, node_ids in graph._components().items()
-        if parent.digest.value in node_ids
-    )
-    provenance = graph.graph_payload(view="provenance", component=parent_component)
-
-    assert {node["id"] for node in provenance["nodes"]} >= {
-        parent.digest.value,
-        child.digest.value,
-    }
-    assert {(edge["source"], edge["target"], edge["relation"]) for edge in provenance["edges"]} >= {
-        (parent.digest.value, child.digest.value, "orchestrates")
-    }
-
-
-def test_run_lineage_follows_a_produced_candidate_across_retry_roots(tmp_path: Path) -> None:
-    root = tmp_path / "oclp"
-    definition = _publish(
-        root,
-        ComputationDefinition(
-            id="urn:example:definition:model-lifecycle",
-            implementation=Implementation(
-                kind="other",
-                locator="example:model-lifecycle",
-                source={"kind": "opaque", "reason": "test fixture"},
-            ),
-        ),
-    )
-    candidate_member = _publish(
-        root,
-        Artifact(
-            id="urn:example:artifact:candidate-model:metadata",
-            name="Candidate model metadata",
-            media_type="application/json",
-            digest=Digest(value="c" * 64),
-            size=1,
-        ),
-    )
-    candidate = _publish(
-        root,
-        ArtifactSet(
-            id="urn:example:artifact-set:candidate-model",
-            name="Candidate model",
-            members=(ArtifactSetMember(name="metadata.json", artifact=candidate_member),),
-        ),
-    )
-    original_root = _publish(
-        root,
-        Invocation(
-            id="urn:example:invocation:model-lifecycle:original",
-            definition=definition,
-        ),
-    )
-    train = _publish(
-        root,
-        Invocation(
-            id="urn:example:invocation:train-candidate:original",
-            definition=definition,
-            parent_invocation=RecordReference(id=original_root.id),
-            outputs={"candidate_model": (candidate,)},
-        ),
-    )
-    failed_backtest = _publish(
-        root,
-        Invocation(
-            id="urn:example:invocation:frozen-backtest:original",
-            definition=definition,
-            parent_invocation=RecordReference(id=original_root.id),
-            inputs={"candidate_model": (candidate,)},
-        ),
-    )
-    retry_root = _publish(
-        root,
-        Invocation(
-            id="urn:example:invocation:model-lifecycle:retry",
-            definition=definition,
-            inputs={"candidate_model": (candidate,)},
-        ),
-    )
-    retry_gate = _publish(
-        root,
-        Invocation(
-            id="urn:example:invocation:model-eligibility-gate:retry",
-            definition=definition,
-            parent_invocation=RecordReference(id=retry_root.id),
-            inputs={"candidate_model": (candidate,)},
-        ),
-    )
-
-    graph = load_project_graph(root)
-    lineage = graph.graph_payload(view="run", run=retry_root.digest.value)
-    lineage_node_ids = {node["id"] for node in lineage["nodes"]}
-
-    assert lineage_node_ids == {
-        original_root.digest.value,
-        train.digest.value,
-        failed_backtest.digest.value,
-        candidate.digest.value,
-        retry_root.digest.value,
-        retry_gate.digest.value,
-    }
+        nodes[refs["root_execution"].digest.value]["status"],
+        nodes[refs["child_execution"].digest.value]["status"],
+    } == {"succeeded"}
     assert {
-        (edge["source"], edge["target"], edge["relation"])
-        for edge in lineage["edges"]
-    } >= {
-        (original_root.digest.value, train.digest.value, "orchestrates"),
-        (original_root.digest.value, failed_backtest.digest.value, "orchestrates"),
-        (train.digest.value, candidate.digest.value, "produces"),
-        (candidate.digest.value, retry_root.digest.value, "consumes"),
-        (retry_root.digest.value, retry_gate.digest.value, "orchestrates"),
-    }
-
-    data_dag = graph.graph_payload(view="derivation", run=retry_root.digest.value)
-    assert {node["id"] for node in data_dag["nodes"]} == lineage_node_ids
-    assert {edge["relation"] for edge in data_dag["edges"]} == {"consumes", "produces"}
-
-    with CyclopsRunIndex(tmp_path / "cyclops.duckdb") as run_index:
-        run_index.rebuild(graph)
-        lineages = run_index.runs_payload()["lineages"]
-
-    assert len(lineages) == 1
-    assert lineages[0]["root_count"] == 2
-    assert {run["id"] for run in lineages[0]["runs"]} == {
-        original_root.digest.value,
-        retry_root.digest.value,
-    }
+        node["status"]
+        for node in nodes.values()
+        if node["kind"] == "event" and "status" in node
+    } == {"succeeded"}
+    started_event = next(
+        node
+        for node in nodes.values()
+        if node["kind"] == "event" and node["label"] == "event\nexecution-started"
+    )
+    assert started_event["record_id"].startswith("urn:example:event:")
+    assert graph.summary()["incomplete_execution_count"] == 0
 
 
-def test_graph_reads_legacy_empty_profile_records_without_rewriting_identity(
+def test_terminal_execution_status_does_not_require_a_lifecycle_profile(
     tmp_path: Path,
 ) -> None:
+    """A request-scoped Execution is complete when its terminal Event is present."""
+
     root = tmp_path / "oclp"
-    current = Artifact(
-        id="urn:example:artifact:legacy-empty-profiles",
-        media_type="text/plain",
-        digest=Digest(value="a" * 64),
-        size=1,
-    )
-    fields = current.__dict__.copy()
-    fields["profiles"] = {}
-    legacy = Artifact.model_construct(**fields)
-    digest = record_digest(legacy)
-    path = root / "artifact" / digest.value[:2] / f"{digest.value}.json"
-    path.parent.mkdir(parents=True)
-    path.write_bytes(canonical_json_bytes(legacy) + b"\n")
+    now = datetime(2026, 9, 2, 20, 30, tzinfo=UTC)
+    with _publisher(root) as publisher:
+        computation = publisher.publish(
+            computation_record(
+                _prepare,
+                source=GitSource(
+                    repository="https://example.test/project.git",
+                    commit="c" * 40,
+                ),
+            )
+        )
+        execution = publisher.publish(
+            Execution(
+                id="urn:example:execution:request-scoped-prediction",
+                name="Request-scoped prediction",
+                computation=computation,
+            )
+        )
+        publisher.publish(
+            Event(
+                id="urn:example:event:request-scoped-prediction:started",
+                execution=execution,
+                event_type="execution-started",
+                occurred_at=now,
+                sequence=0,
+            )
+        )
+        publisher.publish(
+            Event(
+                id="urn:example:event:request-scoped-prediction:terminal",
+                execution=execution,
+                event_type="execution-terminal",
+                occurred_at=now + timedelta(seconds=1),
+                sequence=1,
+                status="succeeded",
+            )
+        )
 
     graph = load_project_graph(root)
-    assert set(graph.records) == {digest.value}
-    assert graph.nodes[0]["record_id"] == current.id
-
-    with DuckdbCatalog(tmp_path / "catalog.duckdb") as catalog:
-        catalog_graph = load_project_graph(root, catalog=catalog)
-    assert set(catalog_graph.records) == {digest.value}
+    node = next(node for node in graph.nodes if node["id"] == execution.digest.value)
+    assert node["status"] == "succeeded"
+    assert graph.summary()["incomplete_execution_count"] == 0
 
 
-def test_graph_compacts_long_artifact_resource_labels_to_a_short_identifier() -> None:
-    assert _compact_label("9a/9a123ca8bb6b72f52cf5e05ae6cb1ebdb.source-bundle") == "9a123ca8"
+def test_release_backed_request_executions_project_as_one_inference_service(
+    tmp_path: Path,
+) -> None:
+    """CYCLOPS may collapse real serving requests without changing OCLP facts."""
 
-
-def test_cyclops_run_index_migrates_existing_navigation_database(tmp_path: Path) -> None:
-    database = tmp_path / "cyclops.duckdb"
-    connection = duckdb.connect(str(database))
-    connection.execute(
-        """
-        CREATE TABLE cyclops_run_members (
-            root_digest VARCHAR NOT NULL,
-            invocation_digest VARCHAR NOT NULL,
-            record_id VARCHAR NOT NULL,
-            label VARCHAR NOT NULL,
-            depth INTEGER NOT NULL,
-            PRIMARY KEY (root_digest, invocation_digest)
+    root = tmp_path / "oclp"
+    refs = _fixture_store(root)
+    now = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
+    with _publisher(root) as publisher:
+        request_one = publisher.json_artifact(
+            artifact_id="urn:example:artifact:inference-request:one",
+            name="Prediction request one",
+            relative_path="request-one.json",
+            value={"hour": 9},
+            created_at=now,
+        ).reference
+        request_two = publisher.json_artifact(
+            artifact_id="urn:example:artifact:inference-request:two",
+            name="Prediction request two",
+            relative_path="request-two.json",
+            value={"hour": 10},
+            created_at=now + timedelta(seconds=1),
+        ).reference
+        response_one = publisher.json_artifact(
+            artifact_id="urn:example:artifact:inference-response:one",
+            name="Prediction response one",
+            relative_path="response-one.json",
+            value={"prediction": 12.5},
+            created_at=now + timedelta(seconds=2),
+        ).reference
+        response_two = publisher.json_artifact(
+            artifact_id="urn:example:artifact:inference-response:two",
+            name="Prediction response two",
+            relative_path="response-two.json",
+            value={"prediction": 13.5},
+            created_at=now + timedelta(seconds=3),
+        ).reference
+        prediction = publisher.publish(
+            computation_record(
+                _prepare,
+                source=GitSource(
+                    repository="https://example.test/project.git",
+                    commit="d" * 40,
+                ),
+            )
         )
-        """
-    )
-    connection.close()
-
-    with CyclopsRunIndex(database) as run_index:
-        columns = {
-            row[1]
-            for row in run_index._connection.execute(
-                "PRAGMA table_info('cyclops_run_members')"
-            ).fetchall()
-        }
-
-    assert {"status", "diagnostic"} <= columns
-
-
-def test_cyclops_api_exposes_graph_record_and_focused_lineage(tmp_path: Path) -> None:
-    root = tmp_path / "oclp"
-    artifact = _publish(
-        root,
-        Artifact(
-            id="urn:example:artifact",
-            media_type="application/octet-stream",
-            digest=Digest(value="c" * 64),
-            size=1,
-        ),
-    )
-    client = TestClient(create_app(root))
-
-    assert client.get("/api/health").json()["record_count"] == 1
-    assert client.get("/api/computations").json()["computations"] == []
-    assert client.get("/api/runs").json()["runs"] == []
-    assert client.get("/api/graph").json()["view"] == "derivation"
-    assert client.get("/api/graph?view=provenance").json()["view"] == "provenance"
-    assert client.get(f"/api/records/{artifact.digest.value}").json()["record"]["id"] == artifact.id
-    assert client.get(f"/api/lineage/{artifact.digest.value}").status_code == 200
-    assert client.get("/api/records/not-a-digest").status_code == 404
-
-    later_artifact = _publish(
-        root,
-        Artifact(
-            id="urn:example:artifact:later",
-            media_type="application/octet-stream",
-            digest=Digest(value="e" * 64),
-            size=1,
-        ),
-    )
-    assert client.get("/api/health").json()["record_count"] == 1
-    assert client.get(f"/api/records/{later_artifact.digest.value}").status_code == 404
-    assert client.get("/api/health?refresh=true").json()["record_count"] == 2
-    assert (
-        client.get(f"/api/records/{later_artifact.digest.value}").json()["record"]["id"]
-        == later_artifact.id
-    )
-
-
-def test_cyclops_api_serializes_concurrent_catalog_loads(tmp_path: Path) -> None:
-    root = tmp_path / "oclp"
-    _publish(
-        root,
-        Artifact(
-            id="urn:example:artifact",
-            media_type="application/octet-stream",
-            digest=Digest(value="d" * 64),
-            size=1,
-        ),
-    )
-    client = TestClient(create_app(root))
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        responses = list(executor.map(client.get, ("/api/health", "/api/graph?view=provenance")))
-
-    assert [response.status_code for response in responses] == [200, 200]
-
-
-def test_cyclops_does_not_lock_the_producer_catalog(tmp_path: Path) -> None:
-    root = tmp_path / "oclp"
-    artifact = Artifact(
-        id="urn:example:artifact:source",
-        media_type="application/octet-stream",
-        digest=Digest(value="a" * 64),
-        size=1,
-    )
-    _publish(root, artifact)
-    catalog_path = root / "catalog.duckdb"
-    with DuckdbCatalog(catalog_path) as producer:
-        producer.publish(artifact)
-
-    with TestClient(create_app(root)) as client:
-        assert client.get("/api/health").status_code == 200
-        # A long-lived Cyclops API must not hold DuckDB's mutually exclusive
-        # cross-process lock while a producer appends new OCLP records.
-        with DuckdbCatalog(catalog_path) as producer:
-            producer.publish(
-                Artifact(
-                    id="urn:example:artifact:new-output",
-                    media_type="application/octet-stream",
-                    digest=Digest(value="b" * 64),
-                    size=1,
+        executions = (
+            publisher.publish(
+                Execution(
+                    id="urn:example:execution:predict:one",
+                    name="Predict request one",
+                    computation=prediction,
+                    inputs={
+                        "model_release": (refs["release"],),
+                        "request": (request_one,),
+                    },
+                    outputs={"response": (response_one,)},
+                )
+            ),
+            publisher.publish(
+                Execution(
+                    id="urn:example:execution:predict:two",
+                    name="Predict request two",
+                    computation=prediction,
+                    inputs={
+                        "model_release": (refs["release"],),
+                        "request": (request_two,),
+                    },
+                    outputs={"response": (response_two,)},
+                )
+            ),
+        )
+        for offset, execution in enumerate(executions):
+            publisher.publish(
+                Event(
+                    id=f"urn:example:event:prediction:{offset}:started",
+                    execution=execution,
+                    event_type="execution-started",
+                    occurred_at=now + timedelta(seconds=offset),
+                    sequence=0,
+                )
+            )
+            publisher.publish(
+                Event(
+                    id=f"urn:example:event:prediction:{offset}:terminal",
+                    execution=execution,
+                    event_type="execution-terminal",
+                    occurred_at=now + timedelta(seconds=offset + 1),
+                    sequence=1,
+                    status="succeeded",
                 )
             )
 
+    graph = load_project_graph(root)
+    services = graph.inference_services_payload()
+    assert len(services) == 1
+    service = services[0]
+    assert service["release_id"] == refs["release"].id
+    assert service["request_count"] == 2
+    assert service["status_counts"] == {"succeeded": 2}
+    assert refs["model"].digest.value not in service["hidden_node_ids"]
+    assert executions[0].digest.value in service["hidden_node_ids"]
+    assert response_one.digest.value in service["hidden_node_ids"]
 
-def test_cyclops_api_caches_a_snapshot_until_manual_refresh(tmp_path: Path) -> None:
+    # A Run is only its own lifecycle. The service is a sibling process in
+    # the wider release lineage, so it appears only when the caller selects
+    # that explicit scope.
+    run_payload = graph.graph_payload(view="run", run=refs["root_execution"].digest.value)
+    assert run_payload["inference_services"] == []
+    lineage_payload = graph.graph_payload(
+        view="run",
+        run=refs["root_execution"].digest.value,
+        lineage=True,
+    )
+    visible_service = lineage_payload["inference_services"][0]
+    assert visible_service["source_node_id"] in {
+        refs["release"].digest.value,
+        refs["model"].digest.value,
+    }
+    # The navigator keeps serving beside training in one lineage, but opening
+    # that service must not append its request materializations to the whole
+    # training graph. Its focused graph keeps only the release handoff plus
+    # the real request Executions and their direct records.
+    assert lineage_payload["lifecycle_groups"][0]["title"] == "Lineage"
+    focused_service = graph.graph_payload(view="run", service=service["id"])
+    focused_node_ids = {node["id"] for node in focused_service["nodes"]}
+    assert set(execution.digest.value for execution in executions) <= focused_node_ids
+    assert refs["root_execution"].digest.value not in focused_node_ids
+    assert refs["release"].digest.value in focused_node_ids
+    assert focused_service["lifecycle_groups"] == [
+        {
+            "id": f"inference-service:{service['id']}",
+            "root_id": service["id"],
+            "title": "Inference service",
+            "label": service["label"],
+            "member_ids": sorted(focused_node_ids),
+        }
+    ]
+
+    with CyclopsRunIndex(root / "cyclops.duckdb") as index:
+        index.rebuild(graph)
+        lineages = index.runs_payload()["lineages"]
+    lineage = next(lineage for lineage in lineages if lineage["inference_services"])
+    assert len(lineage["inference_services"]) == 1
+    assert len(lineage["inference_services"][0]["requests"]) == 2
+    # Raw runs remain in the API for direct consumers, but the explorer tree
+    # shows the release run plus one service child rather than two fake runs.
+    request_execution_ids = {execution.digest.value for execution in executions}
+    assert all(run["id"] not in request_execution_ids for run in lineage["runs"])
+
+
+def test_run_projection_exposes_execution_hierarchy_in_chronological_order(tmp_path: Path) -> None:
     root = tmp_path / "oclp"
-    _publish(
-        root,
-        Artifact(
-            id="urn:example:artifact",
-            media_type="application/octet-stream",
-            digest=Digest(value="f" * 64),
-            size=1,
-        ),
+    refs = _fixture_store(root)
+    graph = load_project_graph(root)
+
+    run = graph.runs_payload()["runs"][0]
+    assert run["execution_count"] == 2
+    assert [member["id"] for member in run["executions"]] == [
+        refs["root_execution"].digest.value,
+        refs["child_execution"].digest.value,
+    ]
+    assert run["timeline"]["started_at"] == "2026-08-30T12:00:00+00:00"
+    assert run["status_counts"] == {"succeeded": 1}
+
+    payload = graph.graph_payload(view="run", run=refs["root_execution"].digest.value)
+    # parent_execution is presented as a lifecycle boundary, not as a second
+    # kind of causal dataflow edge. The boundary contains the entire run
+    # materialization, including its data and Computation records.
+    assert all(edge["relation"] != "orchestrates" for edge in payload["edges"])
+    group = payload["lifecycle_groups"][0]
+    assert group["id"] == f"lifecycle:{refs['root_execution'].digest.value}"
+    assert group["root_id"] == refs["root_execution"].digest.value
+    assert group["label"] == "Prepare features for August"
+    assert {
+        refs["source"].digest.value,
+        refs["features"].digest.value,
+        refs["model"].digest.value,
+        refs["release"].digest.value,
+        refs["root_execution"].digest.value,
+        refs["child_execution"].digest.value,
+    } <= set(group["member_ids"])
+    assert set(group["member_ids"]) == {node["id"] for node in payload["nodes"]}
+    assert any(node["kind"] == "computation" for node in payload["nodes"])
+
+
+def test_lifecycle_profile_groups_real_executions_without_a_controller(tmp_path: Path) -> None:
+    """A profile run is a grouping claim, never a synthetic Execution."""
+
+    root = tmp_path / "oclp"
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
+    run_id = "urn:example:lifecycle:nightly-build"
+    with _publisher(root) as publisher:
+        source = publisher.json_artifact(
+            artifact_id="urn:example:artifact:profile-source",
+            name="Profile source",
+            relative_path="source.json",
+            value={"rows": 12},
+            created_at=now,
+        ).reference
+        features = publisher.json_artifact(
+            artifact_id="urn:example:artifact:profile-features",
+            name="Profile features",
+            relative_path="features.json",
+            value={"rows": 10},
+            created_at=now + timedelta(seconds=1),
+        ).reference
+        source_basis = GitSource(
+            repository="https://example.test/project.git",
+            commit="b" * 40,
+        )
+        prepare = publisher.publish(computation_record(_prepare, source=source_basis))
+        train = publisher.publish(computation_record(_train, source=source_basis))
+        profile = {
+            "lifecycle": {
+                "version": "0.2.0-draft",
+                "run_id": run_id,
+                "run_name": "Nightly build",
+            }
+        }
+        release = publisher.publish(
+            ArtifactSet(
+                id="urn:example:artifact-set:profile-release",
+                name="Profile release",
+                profiles=profile,
+                created_at=now + timedelta(seconds=2),
+                members=(
+                    ArtifactSetMember(name="features", artifact=features),
+                ),
+            )
+        )
+        prepare_execution = publisher.publish(
+            Execution(
+                id="urn:example:execution:profile-prepare",
+                name="Profile prepare",
+                profiles=profile,
+                computation=prepare,
+                inputs={"source": (source,)},
+                outputs={"features": (features,)},
+            )
+        )
+        train_execution = publisher.publish(
+            Execution(
+                id="urn:example:execution:profile-train",
+                name="Profile train",
+                profiles=profile,
+                computation=train,
+                inputs={"features": (features,)},
+            )
+        )
+        for execution, offset in ((prepare_execution, 0), (train_execution, 1)):
+            publisher.publish(
+                Event(
+                    id=f"urn:example:event:{execution.id.rsplit(':', 1)[-1]}:started",
+                    execution=execution,
+                    event_type="execution-started",
+                    occurred_at=now + timedelta(seconds=offset),
+                    sequence=0,
+                )
+            )
+            publisher.publish(
+                Event(
+                    id=f"urn:example:event:{execution.id.rsplit(':', 1)[-1]}:terminal",
+                    execution=execution,
+                    event_type="execution-terminal",
+                    occurred_at=now + timedelta(seconds=offset + 1),
+                    sequence=1,
+                    status="succeeded",
+                )
+            )
+
+    graph = load_project_graph(root)
+    run = graph.runs_payload()["runs"][0]
+    assert run["id"] == run_id
+    assert run["label"] == "Nightly build"
+    assert run["execution_count"] == 2
+    assert run["status_counts"] == {"succeeded": 2}
+    assert {member["depth"] for member in run["executions"]} == {0}
+    payload = graph.graph_payload(view="run", run=run_id)
+    assert {
+        node["id"] for node in payload["nodes"] if node["kind"] == "execution"
+    } == {
+        prepare_execution.digest.value,
+        train_execution.digest.value,
+    }
+    assert release.digest.value in {node["id"] for node in payload["nodes"]}
+    assert all(edge["relation"] != "orchestrates" for edge in payload["edges"])
+    assert len(payload["lifecycle_groups"]) == 1
+    group = payload["lifecycle_groups"][0]
+    assert group["id"] == f"lifecycle:{run_id}"
+    assert group["root_id"] == prepare_execution.digest.value
+    assert group["label"] == "Nightly build"
+    assert {
+        prepare_execution.digest.value,
+        train_execution.digest.value,
+        source.digest.value,
+        features.digest.value,
+        release.digest.value,
+    } <= set(group["member_ids"])
+    timeline = graph.graph_payload(view="timeline", run=run_id)
+    timeline_release = next(
+        node for node in timeline["nodes"] if node["id"] == release.digest.value
+    )
+    assert timeline_release["timeline_role"] == "publication"
+    assert timeline_release["timeline_at"] == "2026-09-01T12:00:02+00:00"
+    focused = graph.graph_payload(
+        view="derivation",
+        run=run_id,
+        execution=prepare_execution.digest.value,
+    )
+    assert release.digest.value not in {node["id"] for node in focused["nodes"]}
+
+
+def test_provenance_and_timeline_bind_events_to_their_execution(tmp_path: Path) -> None:
+    root = tmp_path / "oclp"
+    refs = _fixture_store(root)
+    graph = load_project_graph(root)
+
+    execution = refs["child_execution"].digest.value
+    provenance = graph.graph_payload(view="provenance", execution=execution)
+    assert any(edge["relation"] == "event-execution" for edge in provenance["edges"])
+    assert any(edge["relation"] == "evidence-subject" for edge in provenance["edges"])
+    assert any(node["kind"] == "evidence" for node in provenance["nodes"])
+    assert any(node["kind"] == "computation" for node in provenance["nodes"])
+    timeline = graph.graph_payload(
+        view="timeline",
+        run=refs["root_execution"].digest.value,
+        execution=execution,
+    )
+    model = next(node for node in timeline["nodes"] if node["id"] == refs["model"].digest.value)
+    assert model["timeline_role"] == "output"
+    assert model["timeline_at"] == "2026-08-30T12:00:20+00:00"
+    assert refs["root_execution"].digest.value not in {node["id"] for node in timeline["nodes"]}
+
+
+def test_collection_overlay_keeps_the_artifact_set_and_member_explicit(tmp_path: Path) -> None:
+    root = tmp_path / "oclp"
+    refs = _fixture_store(root)
+    graph = load_project_graph(root)
+
+    payload = graph.graph_payload(view="derivation", execution=refs["child_execution"].digest.value)
+    assert any(
+        edge["source"] == refs["release"].digest.value
+        and edge["target"] == refs["model"].digest.value
+        and edge["relation"] == "contains"
+        for edge in payload["collection_edges"]
     )
 
-    with patch(
-        "oclp_explorer.app.load_project_graph",
-        wraps=load_project_graph,
-    ) as load_graph:
-        with TestClient(create_app(root)) as client:
-            assert client.get("/api/health").status_code == 200
-            assert client.get("/api/runs").status_code == 200
-            assert client.get("/api/graph?view=provenance").status_code == 200
-            assert load_graph.call_count == 1
 
-            assert client.get("/api/health?refresh=true").status_code == 200
-            assert load_graph.call_count == 2
+def test_run_index_and_api_use_execution_names(tmp_path: Path) -> None:
+    root = tmp_path / "oclp"
+    refs = _fixture_store(root)
+    graph = load_project_graph(root)
+    with CyclopsRunIndex(root / "cyclops.duckdb") as index:
+        index.rebuild(graph)
+        indexed = index.runs_payload()
+    assert "executions" in indexed["runs"][0]
+    assert "invocations" not in indexed["runs"][0]
 
-
-def _publish(root: Path, record: object) -> RecordReference:
-    digest = record_digest(record)
-    path = root / record.kind / digest.value[:2] / f"{digest.value}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(canonical_json_bytes(record) + b"\n")
-    return RecordReference(id=record.id, digest=digest)
+    with TestClient(create_app(root)) as client:
+        runs = client.get("/api/runs")
+        assert runs.status_code == 200
+        assert runs.json()["runs"][0]["execution_count"] == 2
+        response = client.get(
+            "/api/graph",
+            params={"view": "timeline", "execution": refs["child_execution"].digest.value},
+        )
+        assert response.status_code == 200
+        assert any(node["kind"] == "execution" for node in response.json()["nodes"])

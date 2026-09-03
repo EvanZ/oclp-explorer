@@ -1,6 +1,6 @@
 [project]
 name = "oclp-explorer"
-version = "0.1.0a0"
+version = "0.2.0a0"
 description = "Cyclops, a read-only explorer for Open Computation Lifecycle Protocol records"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -10,7 +10,7 @@ authors = [
 ]
 dependencies = [
   "fastapi>=0.140.7",
-  "oclp[duckdb] @ git+https://github.com/EvanZ/oclp-python.git@b00d4f4",
+  "oclp[duckdb]>=0.2.0a0",
   "uvicorn>=0.51.0",
 ]
 
@@ -36,6 +36,9 @@ packages = ["src/oclp_explorer"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[tool.uv.sources]
+oclp = { path = "../oclp-python", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Restart the local Cyclops API and Vite frontend used for OCLP dogfooding.
 #
-# Optional: OCLP_DOGFOOD_DIR=/path/to/data/oclp bash scripts/restart-local.sh
+# Defaults to the bike-demand example currently being dogfooded. Override it
+# for another project: OCLP_DOGFOOD_DIR=/path/to/data/oclp bash scripts/restart-local.sh
 
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 explorer_root="$(cd -- "$script_dir/.." && pwd)"
-oclp_dir="${OCLP_DOGFOOD_DIR:-/Users/evanzamir/projects/nba-lineup-model-oclp/data/oclp}"
+oclp_dir="${OCLP_DOGFOOD_DIR:-/Users/evanzamir/projects/oclp-python/examples/bike-demand-service/data/oclp-0.2-evidence}"
 oclp_python_source="${OCLP_PYTHON_SOURCE:-/Users/evanzamir/projects/oclp-python/src}"
 api_port=8002
 frontend_port=5175
@@ -15,9 +16,9 @@ temporary_root="${TMPDIR:-/tmp}"
 runtime_dir="${temporary_root%/}/cyclops-local"
 api_log="$runtime_dir/api.log"
 frontend_log="$runtime_dir/vite.log"
-api_label="com.evanzamir.oclp-explorer.local"
-frontend_label="com.evanzamir.cyclops-vite.local"
-
+launch_domain="gui/$(id -u)"
+api_service="com.oclp-explorer.api"
+frontend_service="com.oclp-explorer.vite"
 listener_pids() {
   lsof -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null || true
 }
@@ -51,8 +52,9 @@ stop_listener() {
   exit 1
 }
 
-remove_launch_service() {
-  launchctl remove "$1" >/dev/null 2>&1 || true
+remove_local_service() {
+  local service="$1"
+  launchctl bootout "$launch_domain/$service" 2>/dev/null || true
 }
 
 wait_for_listener() {
@@ -103,8 +105,8 @@ if [[ ! -d "$oclp_python_source/oclp" ]]; then
 fi
 
 mkdir -p "$runtime_dir"
-remove_launch_service "$api_label"
-remove_launch_service "$frontend_label"
+remove_local_service "$api_service"
+remove_local_service "$frontend_service"
 stop_listener "$api_port" "Cyclops API" "oclp-explorer"
 stop_listener "$frontend_port" "Cyclops Vite" "vite"
 
@@ -120,16 +122,23 @@ if ! npm_bin="$(command -v npm)"; then
 fi
 launch_path="$(dirname -- "$npm_bin"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
-launchctl submit -l "$api_label" -o "$api_log" -e "$api_log" -- \
+: >"$api_log"
+launchctl submit -l "$api_service" -o "$api_log" -e "$api_log" -- \
   /usr/bin/env "PATH=$launch_path" "PYTHONPATH=$oclp_python_source" "$api_bin" \
   --oclp-dir "$oclp_dir" --port "$api_port"
 wait_for_listener "$api_port" "Cyclops API" "$api_log"
 wait_for_api_health "$api_port" "Cyclops API" "$api_log"
+api_pid="$(listener_pids "$api_port")"
 
-launchctl submit -l "$frontend_label" -o "$frontend_log" -e "$frontend_log" -- \
+: >"$frontend_log"
+launchctl submit -l "$frontend_service" -o "$frontend_log" -e "$frontend_log" -- \
   /usr/bin/env "PATH=$launch_path" "$npm_bin" --prefix "$explorer_root/apps/cyclops" run dev
 wait_for_listener "$frontend_port" "Cyclops Vite" "$frontend_log"
+frontend_pid="$(listener_pids "$frontend_port")"
 
 echo "Cyclops is ready at http://127.0.0.1:$frontend_port"
+echo "OCLP store: $oclp_dir"
+echo "API PID: $api_pid"
+echo "Vite PID: $frontend_pid"
 echo "API log: $api_log"
 echo "Vite log: $frontend_log"

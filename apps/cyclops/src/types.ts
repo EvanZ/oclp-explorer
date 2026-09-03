@@ -6,12 +6,18 @@ export type GraphNode = {
   digest: string;
   layer?: "data" | "provenance" | "timeline";
   collection_kind?: "dataset-snapshot";
+  /** Core Artifact media type, supplied separately for semantic icon choice. */
+  media_type?: string;
   /** Read-only presentation metadata derived from Core chronology fields. */
   timeline_at?: string;
   timeline_sequence?: string;
   timeline_end_at?: string;
   timeline_lane?: string;
   timeline_depth?: string;
+  /** Evidence outcome, when this node represents an Evidence record. */
+  outcome?: "pass" | "fail" | "error";
+  /** Terminal execution status, projected on Execution and terminal Event nodes. */
+  status?: "succeeded" | "failed" | "skipped" | "incomplete";
   /** Presentation role for a direct Timeline data binding. */
   timeline_role?: "input" | "output";
 };
@@ -24,18 +30,34 @@ export type GraphEdge = {
   label?: string;
 };
 
+/**
+ * A read-only CYCLOPS presentation boundary for an explicit Execution
+ * hierarchy. It is deliberately not an OCLP record or graph relation.
+ */
+export type LifecycleGroup = {
+  id: string;
+  root_id: string;
+  /** Presentation-only boundary title; lifecycle is the historical default. */
+  title?: "Lifecycle" | "Lineage" | "Inference service";
+  label: string;
+  member_ids: string[];
+};
+
 export type GraphPayload = {
   view: "run" | "derivation" | "provenance" | "timeline" | "reference";
   nodes: GraphNode[];
   edges: GraphEdge[];
   collection_edges: GraphEdge[];
   collection_nodes: GraphNode[];
+  lifecycle_groups: LifecycleGroup[];
+  /** CYCLOPS-only collapsed view of real request Executions for one release. */
+  inference_services: InferenceService[];
 };
 
 export type Computation = {
   id: string;
   label: string;
-  invocation_count: number;
+  execution_count: number;
   artifact_count: number;
   edge_count: number;
 };
@@ -54,7 +76,7 @@ export type Diagnostic = {
   };
 };
 
-export type RunInvocation = {
+export type RunExecution = {
   id: string;
   record_id: string;
   label: string;
@@ -69,26 +91,47 @@ export type Run = {
   label: string;
   timeline: {
     kind: "lifecycle" | "generic" | "none";
-    requested_at: string | null;
     started_at: string | null;
     completed_at: string | null;
     first_event_at: string | null;
     last_event_at: string | null;
   };
-  invocation_count: number;
+  execution_count: number;
   artifact_count: number;
   status_counts: Record<string, number>;
-  invocations: RunInvocation[];
+  executions: RunExecution[];
+};
+
+export type InferenceServiceRequest = RunExecution & {
+  /** The real request-scoped run that owns this immutable Execution. */
+  run_id: string;
+};
+
+export type InferenceService = {
+  /** Presentation ID; this is intentionally not an OCLP record digest. */
+  id: string;
+  release_digest: string;
+  release_id: string;
+  label: string;
+  model_digest?: string;
+  source_node_id?: string | null;
+  request_count: number;
+  status_counts: Record<string, number>;
+  timeline: Run["timeline"];
+  execution_ids?: string[];
+  hidden_node_ids?: string[];
+  requests?: InferenceServiceRequest[];
 };
 
 export type RunLineage = {
   id: string;
   label: string;
   root_count: number;
-  invocation_count: number;
+  execution_count: number;
   artifact_count: number;
   status_counts: Record<string, number>;
   runs: Run[];
+  inference_services: InferenceService[];
 };
 
 export type RunsPayload = {
@@ -102,7 +145,7 @@ export type Summary = {
   node_count: number;
   derivation_edge_count: number;
   reference_edge_count: number;
-  legacy_invocation_count: number;
+  incomplete_execution_count: number;
   counts: Record<string, number>;
 };
 

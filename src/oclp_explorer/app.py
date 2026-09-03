@@ -84,7 +84,7 @@ def create_app(
 
     app = FastAPI(
         title="CYCLOPS — OCLP Project Explorer",
-        version="0.1.0",
+        version="0.2.0-draft",
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -106,7 +106,7 @@ def create_app(
 
     @app.get("/api/runs")
     def runs() -> dict[str, object]:
-        """List root runs and their connected lineage groups for navigation."""
+        """List lifecycle runs and their connected lineage groups for navigation."""
 
         graph()
         with catalog_lock:
@@ -120,13 +120,17 @@ def create_app(
         ),
         component: str | None = None,
         run: str | None = None,
-        invocation: str | None = None,
+        execution: str | None = None,
+        service: str | None = None,
+        lineage: bool = False,
     ) -> dict[str, object]:
         return graph().graph_payload(
             view=view,
             component=component,
             run=run,
-            invocation=invocation,
+            execution=execution,
+            service=service,
+            lineage=lineage,
         )
 
     @app.get("/api/records/{digest}")
@@ -147,7 +151,7 @@ def create_app(
         ),
         component: str | None = None,
         run: str | None = None,
-        invocation: str | None = None,
+        execution: str | None = None,
     ) -> dict[str, object]:
         try:
             return graph().focused_payload(
@@ -156,7 +160,7 @@ def create_app(
                 view=view,
                 component=component,
                 run=run,
-                invocation=invocation,
+                execution=execution,
             )
         except KeyError as error:
             raise HTTPException(

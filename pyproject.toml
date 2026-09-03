@@ -10,7 +10,7 @@ authors = [
 ]
 dependencies = [
   "fastapi>=0.140.7",
-  "oclp[duckdb]>=0.2.0a0",
+  "oclp[duckdb] @ git+https://github.com/EvanZ/oclp-python.git@ff2b4a6",
   "uvicorn>=0.51.0",
 ]
 
@@ -36,9 +36,6 @@ packages = ["src/oclp_explorer"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
-
-[tool.uv.sources]
-oclp = { path = "../oclp-python", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

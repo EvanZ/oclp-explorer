@@ -9,7 +9,7 @@ artifact store. It turns explicit Core bindings into navigable views.
 Point the API at the root that contains the Core record-kind directories:
 
 ```bash
-oclp-explorer --oclp-dir /path/to/data/oclp-0.2
+oclp-explorer --oclp-dir /path/to/data/oclp-0.3
 ```
 
 Then run the bundled client from `apps/cyclops`:
@@ -25,7 +25,7 @@ or source of truth.
 
 ## What Cyclops understands
 
-Core 0.2 makes four relationships explicit:
+Core 0.3 makes four relationships explicit:
 
 ```text
 Computation ─── describes reusable work ───> Execution
@@ -50,8 +50,11 @@ application-specific Evidence details.
 same `run_id`, Cyclops groups those real Executions as one lifecycle run.
 Older stores without that profile field retain the legacy root-Execution and
 `parent_execution` hierarchy. Separate lifecycle runs appear in one lineage
-only when a produced Artifact or ArtifactSet is explicitly consumed by another
-run. This keeps shared lake inputs from joining unrelated runs.
+only when an explicit data handoff connects them: normally an Artifact or
+ArtifactSet one Execution produces and another consumes, or a directly
+published ArtifactSet that explicitly claims one lifecycle and is consumed by
+another. This keeps shared lake inputs from joining unrelated runs without
+inventing a release Execution for a direct collection publication.
 
 Cyclops encloses a run's complete direct materialization—its Executions, direct
 input/output Artifacts, ArtifactSets, and Computations—in a read-only
@@ -130,3 +133,35 @@ not new fields on an Execution.
 Data-DAG edges animate to emphasize artifact flow. Provenance edges stay still
 because they are context rather than material flow. The toolbar can export the
 current complete graph as an animated GIF.
+
+## Roadmap
+
+### Incremental dynamic-graph projection
+
+Cyclops currently builds its cached snapshot by reading and validating the
+complete immutable record store, then rebuilding its local DuckDB navigation
+index. That is intentionally the correctness baseline and recovery path.
+
+For larger or continuously updated stores, the planned direction is an
+incremental, rebuildable graph projection in Cyclops-owned storage. It will
+index Core record UUIDs, explicit reference and derivation edges, lifecycle
+membership, ArtifactSet membership, and Event/Evidence timing as newly
+observed records arrive. The projection must tolerate out-of-order arrival:
+an unresolved reference remains pending until its target record is available.
+
+This does not change OCLP records or make the index authoritative. Immutable
+OCLP records remain the source of truth, and Cyclops must always be able to
+rebuild the index from them. The index simply lets Cyclops fetch the selected
+run, Execution, Artifact, release, or focused neighborhood without parsing an
+entire large project on each refresh.
+
+### Optional workflow topology
+
+Cyclops may later display an application-declared static computation topology
+alongside runtime lineage. Such a view describes possible Computations and
+port bindings before execution; it does not replace the dynamic graph of the
+Artifacts, Executions, Events, and Evidence that actually materialized.
+
+A topology would be an additive view. Runtime lineage remains the authoritative
+record of data-dependent branching, fan-out, retries, failures, and request
+materializations.

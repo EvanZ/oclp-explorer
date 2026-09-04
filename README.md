@@ -19,7 +19,7 @@ Install the backend and point it at an existing OCLP store:
 
 ```bash
 uv sync --group dev
-uv run oclp-explorer --oclp-dir /path/to/data/oclp-0.2 --port 8002
+uv run oclp-explorer --oclp-dir /path/to/data/oclp-0.3 --port 8002
 ```
 
 Then, in another terminal:
@@ -41,7 +41,7 @@ bash scripts/restart-local.sh
 ```
 
 It expects the store at
-`/Users/evanzamir/projects/oclp-python/examples/bike-demand-service/data/oclp-0.2`. Set
+`/Users/evanzamir/projects/oclp-python/examples/bike-demand-service/data/oclp-0.3`. Set
 `OCLP_DOGFOOD_DIR` to use another local OCLP store, and
 `OCLP_PYTHON_SOURCE` to use a compatible local `oclp-python/src` checkout.
 The script refuses to stop an unrelated process that happens to be listening
@@ -55,5 +55,5 @@ uv run ruff check .
 cd apps/cyclops && npm run build
 ```
 
-Read the [Cyclops guide](docs/using-cyclops.md) for the graph model and local
-storage design.
+Read the [Cyclops guide](docs/using-cyclops.md) for the graph model, local
+storage design, and roadmap.

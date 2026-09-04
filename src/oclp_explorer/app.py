@@ -106,7 +106,7 @@ def create_app(
 
     @app.get("/api/runs")
     def runs() -> dict[str, object]:
-        """List lifecycle runs and their connected lineage groups for navigation."""
+        """List runs and their connected lineage groups."""
 
         graph()
         with catalog_lock:
@@ -133,18 +133,18 @@ def create_app(
             lineage=lineage,
         )
 
-    @app.get("/api/records/{digest}")
-    def record(digest: str) -> dict[str, object]:
+    @app.get("/api/records/{record_id}")
+    def record(record_id: str) -> dict[str, object]:
         try:
-            return graph().record_payload(digest)
+            return graph().record_payload(record_id)
         except KeyError as error:
             raise HTTPException(
-                status_code=404, detail=f"Unknown record digest: {digest}"
+                status_code=404, detail=f"Unknown record ID: {record_id}"
             ) from error
 
-    @app.get("/api/lineage/{digest}")
+    @app.get("/api/lineage/{record_id}")
     def lineage(
-        digest: str,
+        record_id: str,
         depth: int = Query(default=2, ge=0, le=6),
         view: str = Query(
             default="derivation", pattern="^(run|derivation|provenance|timeline|reference)$"
@@ -155,7 +155,7 @@ def create_app(
     ) -> dict[str, object]:
         try:
             return graph().focused_payload(
-                digest,
+                record_id,
                 depth=depth,
                 view=view,
                 component=component,
@@ -164,7 +164,7 @@ def create_app(
             )
         except KeyError as error:
             raise HTTPException(
-                status_code=404, detail=f"Unknown record digest: {digest}"
+                status_code=404, detail=f"Unknown record ID: {record_id}"
             ) from error
 
     return app

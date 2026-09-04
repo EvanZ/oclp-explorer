@@ -19,10 +19,12 @@ from oclp.catalog.duckdb import DuckdbCatalog
 from oclp.models import RecordReference
 from oclp.profiles import (
     DATASET_SNAPSHOT_PROFILE,
-    LIFECYCLE_PROFILE,
+    RELEASE_MANIFEST_PROFILE,
+    RUN_PROFILE,
     DatasetSnapshotManifest,
-    LifecycleBinding,
-    lifecycle_timeline,
+    ReleaseManifestBinding,
+    RunBinding,
+    run_timeline,
 )
 from pydantic import ValidationError
 
@@ -50,7 +52,7 @@ class _InvocationSummary:
 class _InvocationTimeline:
     """Portable profile chronology or an honestly labeled generic fallback."""
 
-    kind: Literal["lifecycle", "generic", "none"]
+    kind: Literal["run", "generic", "none"]
     started_at: datetime | None = None
     completed_at: datetime | None = None
     first_event_at: datetime | None = None
@@ -102,11 +104,10 @@ class _InferenceService:
     """
 
     id: str
-    release_digest: str
-    release_id: str
+    release_record_id: str
     label: str
-    model_digest: str
-    execution_digests: tuple[str, ...]
+    model_record_id: str
+    execution_ids: tuple[str, ...]
     hidden_node_ids: tuple[str, ...]
 
 
@@ -115,7 +116,11 @@ class OclpProjectGraph:
     """An immutable, API-ready projection of one OCLP record store."""
 
     root: Path
+    # ``records`` is keyed by the Core record UUID.  The catalog's canonical
+    # JSON hash remains useful local integrity metadata, but is deliberately
+    # not graph identity and never participates in reference resolution.
     records: dict[str, Any]
+    record_digests: dict[str, str]
     nodes: tuple[dict[str, str], ...]
     reference_edges: tuple[dict[str, str], ...]
     derivation_edges: tuple[dict[str, str], ...]
@@ -169,12 +174,7 @@ class OclpProjectGraph:
         return {"computations": computations}
 
     def runs_payload(self) -> dict[str, object]:
-        """Return profile-identified or legacy-hierarchy lifecycle runs.
-
-        A lifecycle profile ``run_id`` groups real Executions without adding a
-        Core Run record or inventing an orchestration dataflow edge. Older
-        records without that profile field retain parent-execution grouping.
-        """
+        """Return profile-identified or legacy-hierarchy lifecycle runs."""
 
         runs = []
         lifecycle_runs = self._lifecycle_runs()
@@ -242,9 +242,9 @@ class OclpProjectGraph:
         A request belongs to an Inference service only when all of these facts
         are present in immutable records:
 
-        * its Execution's named ``model_release`` input is a digest-bound
-          reference to a recorded ArtifactSet; and
-        * that set has a digest-bound member named or role-labelled ``model``.
+        * its Execution's named ``model_release`` input names a recorded
+          ArtifactSet; and
+        * that set has a member named or role-labelled ``model``.
 
         This deliberately avoids inferring a service from a computation name,
         a locator, a loose artifact-name match, or an application parameter.
@@ -254,81 +254,78 @@ class OclpProjectGraph:
         """
 
         releases = {
-            digest: record
-            for digest, record in self.records.items()
+            record_id: record
+            for record_id, record in self.records.items()
             if record.kind == "artifact_set"
         }
 
         grouped: dict[str, dict[str, object]] = {}
-        for execution_digest, execution in self.records.items():
+        for execution_id, execution in self.records.items():
             if execution.kind != "execution":
                 continue
             release_inputs = {
-                _reference_digest(reference)
+                _reference_id(reference)
                 for reference in execution.inputs.get("model_release", ())
             }
             release_inputs.discard(None)
             if len(release_inputs) != 1:
                 continue
-            release_digest = next(iter(release_inputs))
-            release = releases.get(release_digest)
+            release_record_id = next(iter(release_inputs))
+            release = releases.get(release_record_id)
             if release is None:
                 continue
             model_members = {
-                _reference_digest(member.artifact)
+                _reference_id(member.artifact)
                 for member in release.members
                 if member.name == "model" or member.role == "model"
             }
             model_members.discard(None)
             if len(model_members) != 1:
                 continue
-            model_digest = next(iter(model_members))
-            service_id = f"inference-service:{release_digest}"
+            model_record_id = next(iter(model_members))
             entry = grouped.setdefault(
-                service_id,
+                release_record_id,
                 {
-                    "release_digest": release_digest,
-                    "release_id": release.id,
-                    "label": release.name or release.id,
-                    "model_digest": model_digest,
+                    "release_record_id": release_record_id,
+                    "label": release.name or release_record_id,
+                    "model_record_id": model_record_id,
                     "release_node_ids": {
-                        release_digest,
+                        release_record_id,
                         *(
-                            _reference_digest(member.artifact)
+                            _reference_id(member.artifact)
                             for member in release.members
                         ),
                     }
                     - {None},
-                    "execution_digests": [],
+                    "execution_ids": [],
                 },
             )
-            entry["execution_digests"].append(execution_digest)
+            entry["execution_ids"].append(execution_id)
 
         services: list[_InferenceService] = []
-        for service_id, entry in grouped.items():
-            execution_digests = tuple(
+        for release_record_id, entry in grouped.items():
+            execution_ids = tuple(
                 sorted(
-                    entry["execution_digests"],
-                    key=lambda digest: (
-                        self.execution_summaries[digest].timeline.ordering_at
+                    entry["execution_ids"],
+                    key=lambda record_id: (
+                        self.execution_summaries[record_id].timeline.ordering_at
                         or datetime.max.replace(tzinfo=UTC),
-                        self.records[digest].id,
+                        self.records[record_id].id,
                     ),
                 )
             )
             release_node_ids = set(entry["release_node_ids"])
             hidden_node_ids = self._inference_service_hidden_node_ids(
-                set(execution_digests),
+                set(execution_ids),
                 release_node_ids,
             )
             services.append(
                 _InferenceService(
-                    id=service_id,
-                    release_digest=str(entry["release_digest"]),
-                    release_id=str(entry["release_id"]),
+                    id=f"inference-service:{release_record_id}",
+                    release_record_id=str(entry["release_record_id"]),
                     label=str(entry["label"]),
-                    model_digest=str(entry["model_digest"]),
-                    execution_digests=execution_digests,
+                    model_record_id=str(entry["model_record_id"]),
+                    execution_ids=execution_ids,
                     hidden_node_ids=tuple(sorted(hidden_node_ids)),
                 )
             )
@@ -336,24 +333,23 @@ class OclpProjectGraph:
         return [
             {
                 "id": service.id,
-                "release_digest": service.release_digest,
-                "release_id": service.release_id,
+                "release_record_id": service.release_record_id,
                 "label": service.label,
-                "model_digest": service.model_digest,
-                "execution_ids": list(service.execution_digests),
+                "model_record_id": service.model_record_id,
+                "execution_ids": list(service.execution_ids),
                 "hidden_node_ids": list(service.hidden_node_ids),
-                "request_count": len(service.execution_digests),
+                "request_count": len(service.execution_ids),
                 "status_counts": dict(
                     sorted(
                         Counter(
-                            self.execution_states[digest].status
-                            for digest in service.execution_digests
+                            self.execution_states[record_id].status
+                            for record_id in service.execution_ids
                         ).items()
                     )
                 ),
                 "timeline": _aggregate_run_timeline(
-                    self.execution_summaries[digest].timeline
-                    for digest in service.execution_digests
+                    self.execution_summaries[record_id].timeline
+                    for record_id in service.execution_ids
                 ).model_dump(),
             }
             for service in services
@@ -369,12 +365,24 @@ class OclpProjectGraph:
         service: str | None = None,
         lineage: bool = False,
     ) -> dict[str, object]:
-        """Return run lineage, Data DAG, provenance context, timeline, or references."""
+        """Return lifecycle, Data DAG, provenance context, timeline, or references."""
 
         if service is not None:
-            if view != "run":
-                raise ValueError("An inference service can only be shown in Run lineage view")
-            nodes, edges = self._inference_service_view(service)
+            if view == "run":
+                nodes, edges = self._inference_service_view(service)
+            elif view == "provenance":
+                service_nodes, _ = self._inference_service_view(service)
+                nodes, edges = self._provenance_view(
+                    component=None,
+                    run=None,
+                    invocation=None,
+                    data_nodes=service_nodes,
+                    scoped_execution_ids=set(self._inference_service(service)["execution_ids"]),
+                )
+            else:
+                raise ValueError(
+                    "An inference service can only be shown in a run or provenance view"
+                )
         else:
             nodes, edges = self._view(
                 view,
@@ -488,13 +496,7 @@ class OclpProjectGraph:
         *,
         include_lineage: bool,
     ) -> list[dict[str, object]]:
-        """Add a lineage boundary around sibling lifecycle/service graphs.
-
-        The inner lifecycle boundaries preserve their exact profile or legacy
-        ownership.  The outer boundary is explicitly named ``Lineage`` so it
-        can include a service that merely consumes a release and is not
-        orchestrated by the training lifecycle.
-        """
+        """Add a lineage boundary around sibling lifecycle/service graphs."""
 
         groups = self._lifecycle_groups(visible_node_ids)
         if run is None or not include_lineage:
@@ -508,10 +510,6 @@ class OclpProjectGraph:
             0,
             {
                 "id": f"lineage:{min(lineage_run_ids)}",
-                # ``root_id`` must name a visible graph record for the
-                # frontend boundary projection.  A lifecycle ``run_id`` is
-                # profile metadata rather than a node, so anchor the outer
-                # presentation group at the selected run's real Execution.
                 "root_id": lifecycle_runs[selected_run].anchor_execution,
                 "title": "Lineage",
                 "label": "Connected release and service runs",
@@ -532,10 +530,10 @@ class OclpProjectGraph:
             if not execution_ids & visible_node_ids:
                 continue
             source_node_id = (
-                service["release_digest"]
-                if service["release_digest"] in visible_node_ids
-                else service["model_digest"]
-                if service["model_digest"] in visible_node_ids
+                service["release_record_id"]
+                if service["release_record_id"] in visible_node_ids
+                else service["model_record_id"]
+                if service["model_record_id"] in visible_node_ids
                 else None
             )
             services.append(
@@ -601,18 +599,19 @@ class OclpProjectGraph:
                     changed = True
         return hidden
 
-    def record_payload(self, digest: str) -> dict[str, object]:
-        """Return one stored record and its graph identity."""
+    def record_payload(self, record_id: str) -> dict[str, object]:
+        """Return one stored record by its Core UUID."""
 
-        record = self.records[digest]
+        record = self.records[record_id]
         return {
-            "digest": digest,
+            "id": record_id,
+            "record_digest": f"sha256:{self.record_digests[record_id]}",
             "record": record.model_dump(mode="json", exclude_none=True),
         }
 
     def focused_payload(
         self,
-        digest: str,
+        record_id: str,
         *,
         depth: int,
         view: str = "derivation",
@@ -620,10 +619,10 @@ class OclpProjectGraph:
         run: str | None = None,
         execution: str | None = None,
     ) -> dict[str, object]:
-        """Return the undirected lineage neighborhood around one record digest."""
+        """Return the undirected lineage neighborhood around one record UUID."""
 
-        if digest not in self.records:
-            raise KeyError(digest)
+        if record_id not in self.records:
+            raise KeyError(record_id)
         nodes, edges = self._view(
             view,
             component=component,
@@ -631,7 +630,7 @@ class OclpProjectGraph:
             invocation=execution,
         )
         adjacent: dict[str, set[str]] = {node["id"]: set() for node in nodes}
-        if digest not in adjacent:
+        if record_id not in adjacent:
             return {
                 "view": view,
                 "nodes": [],
@@ -644,8 +643,8 @@ class OclpProjectGraph:
         for edge in edges:
             adjacent[edge["source"]].add(edge["target"])
             adjacent[edge["target"]].add(edge["source"])
-        selected = {digest}
-        frontier = deque([(digest, 0)])
+        selected = {record_id}
+        frontier = deque([(record_id, 0)])
         while frontier:
             current, distance = frontier.popleft()
             if distance == depth:
@@ -687,17 +686,7 @@ class OclpProjectGraph:
         return payload
 
     def _lifecycle_groups(self, visible_node_ids: set[str]) -> list[dict[str, object]]:
-        """Return visual lifecycle boundaries for visible run materializations.
-
-        A profile-backed group includes all real Executions that claim the
-        same lifecycle ``run_id``. Legacy records use their explicit
-        parent-execution hierarchy. Members include every direct input/output
-        Artifact, ArtifactSet, and Computation of those Executions—not merely
-        the Execution records. Members are never hidden or collapsed:
-        CYCLOPS uses the group solely to show one lifecycle's full
-        materialization. Artifact producer/consumer bindings remain the
-        graph's only causal flow relations.
-        """
+        """Return visual lifecycle boundaries for visible run materializations."""
 
         groups: list[dict[str, object]] = []
         lifecycle_runs = self._lifecycle_runs()
@@ -706,26 +695,26 @@ class OclpProjectGraph:
             depths = lifecycle_run.execution_depths
             lifecycle_node_ids = self._lifecycle_node_ids(set(depths))
             member_ids = [
-                digest
-                for digest in sorted(
+                record_id
+                for record_id in sorted(
                     lifecycle_node_ids,
-                    key=lambda digest: (
-                        0 if digest == lifecycle_run.anchor_execution else 1,
-                        depths.get(digest, -1),
-                        self.execution_summaries[digest].timeline.ordering_at
-                        if digest in self.execution_summaries
+                    key=lambda record_id: (
+                        0 if record_id == lifecycle_run.anchor_execution else 1,
+                        depths.get(record_id, -1),
+                        self.execution_summaries[record_id].timeline.ordering_at
+                        if record_id in self.execution_summaries
                         else None
                         or datetime.max.replace(tzinfo=UTC),
-                        self.records[digest].id,
+                        self.records[record_id].id,
                     ),
                 )
-                if digest in visible_node_ids
+                if record_id in visible_node_ids
             ]
             if lifecycle_run.anchor_execution not in member_ids or len(member_ids) < 2:
                 continue
             groups.append(
                 {
-                    "id": f"lifecycle:{run_id}",
+                    "id": f"run:{run_id}",
                     "root_id": lifecycle_run.anchor_execution,
                     "label": (
                         lifecycle_run.label
@@ -772,6 +761,7 @@ class OclpProjectGraph:
                 component,
                 run=run,
                 invocation=invocation,
+                include_lineage=lineage,
             )
         if view == "timeline":
             return self._timeline_view(run, invocation=invocation)
@@ -806,14 +796,36 @@ class OclpProjectGraph:
                 for edge in self.derivation_edges
                 if edge["source"] in derivation_node_ids and edge["target"] in derivation_node_ids
             )
-            derivation_node_ids.update(
-                self._artifact_set_node_ids(
-                    {edge["target"] for edge in derivation_edges if edge["relation"] == "produces"}
+            # A focused Execution view remains its strict Artifact →
+            # Execution → Artifact materialization. A direct release is
+            # related to a run through member provenance, but it was not
+            # produced by this Execution; include it only in a run/component
+            # projection where that broader publication context is requested.
+            if invocation is None:
+                derivation_node_ids.update(
+                    self._release_publication_node_ids(
+                        {
+                            edge["target"]
+                            for edge in derivation_edges
+                            if edge["relation"] == "produces"
+                        }
+                    )
                 )
+            release_manifest_edges = tuple(
+                edge
+                for edge in self.reference_edges
+                if edge["relation"] == "release-manifest"
+                and edge["source"] in derivation_node_ids
+                and edge["target"] in derivation_node_ids
             )
             return (
                 tuple(node for node in self.nodes if node["id"] in derivation_node_ids),
-                derivation_edges,
+                tuple(
+                    sorted(
+                        (*derivation_edges, *release_manifest_edges),
+                        key=lambda edge: (edge["relation"], edge["id"]),
+                    )
+                ),
             )
         raise ValueError(f"Unknown graph view: {view}")
 
@@ -838,10 +850,13 @@ class OclpProjectGraph:
                 raise KeyError(f"Execution {invocation} is not part of the selected run")
             invocation_depths = {invocation: invocation_depths[invocation]}
         invocation_ids = set(invocation_depths)
-        direct_artifact_set_ids = (
-            self._profiled_artifact_set_node_ids(invocation_ids)
-            if invocation is None
-            else set()
+        output_artifact_ids = {
+            edge["target"]
+            for edge in self.derivation_edges
+            if edge["relation"] == "produces" and edge["source"] in invocation_ids
+        }
+        direct_materialization_ids = self._release_publication_node_ids(
+            output_artifact_ids
         )
         evidence_sequence_tiebreakers = _evidence_sequence_tiebreakers(
             self.records,
@@ -849,7 +864,7 @@ class OclpProjectGraph:
         )
         timeline_owner: dict[str, str] = {}
         timeline_roles: dict[str, str] = {}
-        timeline_node_ids = set(invocation_ids) | direct_artifact_set_ids
+        timeline_node_ids = set(invocation_ids) | direct_materialization_ids
         for edge in self.reference_edges:
             if (
                 edge["relation"] in {"event-execution", "evidence-subject"}
@@ -898,7 +913,7 @@ class OclpProjectGraph:
                     }
                 )
                 continue
-            if digest in direct_artifact_set_ids:
+            if digest in direct_materialization_ids:
                 created_at = _timestamp(record.created_at)
                 nodes.append(
                     {
@@ -956,6 +971,13 @@ class OclpProjectGraph:
                             and edge["source"] in timeline_node_ids
                             and edge["target"] in timeline_node_ids
                         ),
+                        *(
+                            edge
+                            for edge in self.reference_edges
+                            if edge["relation"] == "release-manifest"
+                            and edge["source"] in timeline_node_ids
+                            and edge["target"] in timeline_node_ids
+                        ),
                     ),
                     key=lambda edge: (edge["relation"], edge["id"]),
                 )
@@ -968,6 +990,9 @@ class OclpProjectGraph:
         *,
         run: str | None,
         invocation: str | None,
+        data_nodes: tuple[dict[str, str], ...] | None = None,
+        scoped_execution_ids: set[str] | None = None,
+        include_lineage: bool = False,
     ) -> tuple[tuple[dict[str, str], ...], tuple[dict[str, str], ...]]:
         """Overlay non-dataflow Core context on the same Data DAG nodes.
 
@@ -977,17 +1002,31 @@ class OclpProjectGraph:
         overlay, rather than a second provenance edge.
         """
 
-        data_nodes, _ = self._view(
-            "derivation",
-            component=component,
-            run=run,
-            invocation=invocation,
-        )
+        if data_nodes is None and include_lineage and run is not None and invocation is None:
+            # A Lineage selection is the explicit aggregate of every
+            # handoff-connected materialization. Its provenance must use that
+            # same complete data graph—not quietly collapse to the initially
+            # selected lifecycle run.
+            data_nodes, _ = self._run_view(run, include_lineage=True)
+            scoped_execution_ids = set(
+                self._run_lineage_invocation_depths(self._resolve_run(run))
+            )
+        elif data_nodes is None:
+            data_nodes, _ = self._view(
+                "derivation",
+                component=component,
+                run=run,
+                invocation=invocation,
+            )
         data_node_ids = {node["id"] for node in data_nodes}
         context_node_ids = set(data_node_ids)
-        scoped_invocations = {
-            digest for digest in data_node_ids if self.records[digest].kind == "execution"
-        }
+        scoped_invocations = (
+            set(scoped_execution_ids)
+            if scoped_execution_ids is not None
+            else {
+                digest for digest in data_node_ids if self.records[digest].kind == "execution"
+            }
+        )
         include_orchestration = invocation is None and (run is not None or component is not None)
         if include_orchestration:
             changed_invocations = True
@@ -1067,13 +1106,13 @@ class OclpProjectGraph:
         *,
         include_lineage: bool = False,
     ) -> tuple[tuple[dict[str, str], ...], tuple[dict[str, str], ...]]:
-        """Show the real Executions and data bindings in a lifecycle run.
+        """Show the real Executions and data bindings in one run.
 
-        A profile-backed run is a common ``profiles.lifecycle.run_id`` claimed
+        A profile-backed run is a common ``profiles.run.run_id`` claimed
         by real Executions. Legacy records retain their explicit
         ``parent_execution`` hierarchy. A caller must explicitly request the
-        larger lineage scope; selecting a Run never silently appends sibling
-        serving or downstream lifecycles.
+        larger lineage scope; selecting a Run never silently appends a
+        downstream service or other handoff run.
         """
 
         root_digest = self._resolve_run(run)
@@ -1086,7 +1125,8 @@ class OclpProjectGraph:
         edges = tuple(
             edge
             for edge in (*self.derivation_edges, *self.reference_edges)
-            if edge["relation"] in {"consumes", "produces", "computation"}
+            if edge["relation"]
+            in {"consumes", "produces", "computation", "release-manifest"}
             and edge["source"] in data_node_ids
             and edge["target"] in data_node_ids
         )
@@ -1116,44 +1156,31 @@ class OclpProjectGraph:
             for edge in self.derivation_edges
             if edge["relation"] == "produces" and edge["source"] in execution_digests
         }
-        node_ids.update(self._artifact_set_node_ids(output_artifact_ids))
-        node_ids.update(self._profiled_artifact_set_node_ids(execution_digests))
+        node_ids.update(self._release_publication_node_ids(output_artifact_ids))
         return node_ids
 
-    def _profiled_artifact_set_node_ids(
+    def _release_publication_node_ids(
         self,
-        execution_digests: set[str],
+        output_artifact_ids: set[str],
     ) -> set[str]:
-        """Return ArtifactSets directly published into the selected lifecycle.
+        """Return releases assembled from an Execution's actual outputs.
 
-        An ArtifactSet may be a direct collection-publication operation rather
-        than an Execution output. Its explicit lifecycle profile is the honest
-        association in that case; adding a synthetic producer edge would make
-        the data graph claim a computation that did not occur.
+        Publishing an ArtifactSet is not a Computation and must not claim the
+        Execution-only run profile. Its association is instead derived
+        from its explicit membership: a release is relevant to a run when one
+        of its members was emitted by that run. A release-manifest profile then
+        provides the one-way, non-cyclic link from its sidecar Artifact to the
+        exact set it describes.
         """
 
-        run_ids: set[str] = set()
-        for digest in execution_digests:
-            binding_data = (self.records[digest].profiles or {}).get(
-                LIFECYCLE_PROFILE
-            )
-            if binding_data is None:
-                continue
-            try:
-                binding = LifecycleBinding.model_validate(binding_data)
-            except ValidationError:
-                continue
-            if binding.run_id is not None:
-                run_ids.add(binding.run_id)
-
-        if not run_ids:
-            return set()
-        return {
-            digest
-            for digest, record in self.records.items()
-            if record.kind == "artifact_set"
-            and _record_lifecycle_run_id(record) in run_ids
+        artifact_set_ids = self._artifact_set_node_ids(output_artifact_ids)
+        manifest_ids = {
+            edge["source"]
+            for edge in self.reference_edges
+            if edge["relation"] == "release-manifest"
+            and edge["target"] in artifact_set_ids
         }
+        return artifact_set_ids | manifest_ids
 
     def _artifact_set_node_ids(self, output_artifact_ids: set[str]) -> set[str]:
         """Return release sets bound to this computation's output scope.
@@ -1185,10 +1212,6 @@ class OclpProjectGraph:
             if edge["target"] in output_artifact_ids
             and self.records[edge["source"]].kind == "artifact_set"
             and edge["source"] not in explicitly_produced_sets
-            # A directly published collection carries its lifecycle profile.
-            # It belongs to the lifecycle projection, not to every focused
-            # Execution that happened to produce one of its members.
-            and _record_lifecycle_run_id(self.records[edge["source"]]) is None
         }
 
     def _data_node_ids(
@@ -1209,7 +1232,12 @@ class OclpProjectGraph:
                 raise ValueError(f"Execution {invocation} is not part of run {run}")
             return self._invocation_data_node_ids({invocation})
         if run is not None:
-            return self._run_lineage_data_node_ids(self._resolve_run(run))
+            # A selected Run owns only its own direct materialization.  A
+            # lineage is a deliberately broader presentation selected through
+            # ``view=run&lineage=true``; provenance for a Run must not pull a
+            # sibling serving run into the overlay and leave its events
+            # visually detached from the selected graph.
+            return self._run_data_node_ids(self._resolve_run(run))
         return self._component_node_ids(component)
 
     def _lifecycle_runs(self) -> dict[str, _LifecycleRun]:
@@ -1217,32 +1245,31 @@ class OclpProjectGraph:
 
         A profile run contains only real Executions. It does not manufacture a
         controller Execution merely to give an orchestrator a navigation root.
-        Existing records that predate ``profiles.lifecycle.run_id`` continue to
+        Existing records that predate ``profiles.run.run_id`` continue to
         use their explicit parent-execution hierarchy.
         """
 
         profile_members: dict[str, list[str]] = {}
         profile_names: dict[str, str | None] = {}
-        profile_execution_digests: set[str] = set()
+        profile_execution_ids: set[str] = set()
         for digest, record in self.records.items():
             if record.kind != "execution":
                 continue
-            binding_data = (record.profiles or {}).get(LIFECYCLE_PROFILE)
+            binding_data = (record.profiles or {}).get(RUN_PROFILE)
             if binding_data is None:
                 continue
             try:
-                binding = LifecycleBinding.model_validate(binding_data)
+                binding = RunBinding.model_validate(binding_data)
             except ValidationError:
                 continue
-            if binding.run_id is None:
-                continue
-            profile_members.setdefault(binding.run_id, []).append(digest)
-            profile_execution_digests.add(digest)
-            existing_name = profile_names.get(binding.run_id)
-            if existing_name is None and binding.run_name is not None:
-                profile_names[binding.run_id] = binding.run_name
+            run_id = str(binding.run_id)
+            profile_members.setdefault(run_id, []).append(digest)
+            profile_execution_ids.add(digest)
+            existing_name = profile_names.get(run_id)
+            if existing_name is None:
+                profile_names[run_id] = binding.run_name
             else:
-                profile_names.setdefault(binding.run_id, binding.run_name)
+                profile_names.setdefault(run_id, binding.run_name)
 
         runs: dict[str, _LifecycleRun] = {}
         for run_id, members in profile_members.items():
@@ -1268,22 +1295,22 @@ class OclpProjectGraph:
                 profile_backed=True,
             )
 
-        legacy_execution_digests = {
+        legacy_execution_ids = {
             digest
             for digest, record in self.records.items()
-            if record.kind == "execution" and digest not in profile_execution_digests
+            if record.kind == "execution" and digest not in profile_execution_ids
         }
         legacy_children = {
             edge["target"]
             for edge in self.reference_edges
             if edge["relation"] == "orchestrates"
-            and edge["source"] in legacy_execution_digests
-            and edge["target"] in legacy_execution_digests
+            and edge["source"] in legacy_execution_ids
+            and edge["target"] in legacy_execution_ids
         }
-        for root_digest in legacy_execution_digests - legacy_children:
+        for root_digest in legacy_execution_ids - legacy_children:
             depths = self._legacy_run_invocation_depths(
                 root_digest,
-                allowed=legacy_execution_digests,
+                allowed=legacy_execution_ids,
             )
             runs[root_digest] = _LifecycleRun(
                 id=root_digest,
@@ -1363,39 +1390,32 @@ class OclpProjectGraph:
         return self._lifecycle_node_ids(set(self._run_invocation_depths(run_id)))
 
     def _run_lineage_data_node_ids(self, run_id: str) -> set[str]:
-        """Return direct data bindings for all lifecycle runs in one lineage."""
+        """Return direct data bindings for all handoff-connected runs."""
 
         return self._lifecycle_node_ids(
             set(self._run_lineage_invocation_depths(run_id))
         )
 
     def _run_lineage_run_ids(self, run_id: str) -> tuple[str, ...]:
-        """Return lifecycle runs connected by producer/consumer bindings.
+        """Return runs connected by explicit producer/consumer handoffs.
 
-        This deliberately does *not* treat shared, unproduced inputs as a
-        connection. Crossing a run boundary requires an Artifact or
-        ArtifactSet that one Execution explicitly produced and another
-        explicitly consumed. That includes retry and handoff lifecycles while
-        avoiding a project-wide graph merely because jobs read the same lake.
+        Shared, unproduced inputs do not connect runs. Crossing a run boundary
+        requires an Artifact or ArtifactSet that one Execution produced and a
+        different Execution consumed.
         """
 
         lifecycle_runs = self._lifecycle_runs()
         if run_id not in lifecycle_runs:
             raise ValueError(f"Unknown lifecycle run: {run_id}")
         runs_by_execution = {
-            execution_digest: lifecycle_run_id
+            execution_id: lifecycle_run_id
             for lifecycle_run_id, lifecycle_run in lifecycle_runs.items()
-            for execution_digest in lifecycle_run.execution_depths
+            for execution_id in lifecycle_run.execution_depths
         }
         selected_run_ids = {run_id}
         changed = True
         while changed:
             changed = False
-            execution_digests = {
-                execution_digest
-                for selected_run_id in selected_run_ids
-                for execution_digest in lifecycle_runs[selected_run_id].execution_depths
-            }
             produced_by_artifact: dict[str, set[str]] = {}
             consumed_by_artifact: dict[str, set[str]] = {}
             for edge in self.derivation_edges:
@@ -1403,22 +1423,41 @@ class OclpProjectGraph:
                     produced_by_artifact.setdefault(edge["target"], set()).add(edge["source"])
                 elif edge["relation"] == "consumes":
                     consumed_by_artifact.setdefault(edge["source"], set()).add(edge["target"])
-            for artifact_digest, producers in produced_by_artifact.items():
-                consumers = consumed_by_artifact.get(artifact_digest, set())
-                bridge_executions = (
-                    producers | consumers
-                    if producers & execution_digests or consumers & execution_digests
-                    else set()
-                )
-                for execution_digest in bridge_executions:
-                    connected_run_id = runs_by_execution.get(execution_digest)
-                    if (
-                        connected_run_id is not None
-                        and connected_run_id not in selected_run_ids
-                    ):
-                        selected_run_ids.add(connected_run_id)
-                        changed = True
-
+            for artifact_id, consumers in consumed_by_artifact.items():
+                producers = produced_by_artifact.get(artifact_id, set())
+                producer_run_ids = {
+                    runs_by_execution[execution_id]
+                    for execution_id in producers
+                    if execution_id in runs_by_execution
+                }
+                # Consuming a set consumes its explicitly declared members as
+                # a collection. Those member producer/consumer relationships
+                # connect runs without manufacturing a publication Execution
+                # or misusing the Execution-only lifecycle profile on the set.
+                if self.records[artifact_id].kind == "artifact_set":
+                    for membership in self.collection_edges:
+                        if membership["source"] != artifact_id:
+                            continue
+                        producer_run_ids.update(
+                            runs_by_execution[execution_id]
+                            for execution_id in produced_by_artifact.get(
+                                membership["target"], set()
+                            )
+                            if execution_id in runs_by_execution
+                        )
+                consumer_run_ids = {
+                    runs_by_execution[execution_id]
+                    for execution_id in consumers
+                    if execution_id in runs_by_execution
+                }
+                if not producer_run_ids or not consumer_run_ids:
+                    continue
+                connected_run_ids = producer_run_ids | consumer_run_ids
+                if not connected_run_ids & selected_run_ids:
+                    continue
+                for connected_run_id in connected_run_ids - selected_run_ids:
+                    selected_run_ids.add(connected_run_id)
+                    changed = True
         return tuple(
             [run_id]
             + sorted(
@@ -1432,7 +1471,7 @@ class OclpProjectGraph:
         )
 
     def _run_lineage_invocation_depths(self, run_id: str) -> dict[str, int]:
-        """Return all real Executions in a run's produced/consumed lineage."""
+        """Return all real Executions in a run's handoff lineage."""
 
         depths: dict[str, int] = {}
         for selected_run_id in self._run_lineage_run_ids(run_id):
@@ -1449,18 +1488,17 @@ class OclpProjectGraph:
         return node_ids
 
     def _run_identifier(self, root_digest: str) -> str:
-        """Prefer caller-owned run_id from the root request Event for display."""
+        """Prefer a caller-owned run ID from the root start Event for display."""
 
         for record in self.records.values():
             if (
                 record.kind == "event"
                 and record.event_type == "execution-started"
-                and record.execution.digest is not None
-                and record.execution.digest.value == root_digest
+                and record.execution.id == root_digest
                 and isinstance(record.data.get("run_id"), str)
             ):
                 return record.data["run_id"]
-        return self.records[root_digest].id.rsplit(":", maxsplit=1)[-1]
+        return self.records[root_digest].id[:8]
 
     def _components(self) -> dict[str, set[str]]:
         adjacency: dict[str, set[str]] = {
@@ -1504,7 +1542,7 @@ def load_project_graph(
     """Load all Core records below *root* and project their explicit bindings."""
 
     root_path = Path(root)
-    records = _load_records(root_path, catalog=catalog)
+    records, record_digests = _load_records(root_path, catalog=catalog)
     if not records:
         raise ValueError(f"No OCLP records found under {root_path}")
     _validate_project_records(records)
@@ -1516,12 +1554,18 @@ def load_project_graph(
     derivation_edges = tuple(_derivation_edges(records))
     collection_edges = tuple(_collection_edges(root_path, records))
     nodes = tuple(
-        _node(digest, record, execution_states=execution_states)
-        for digest, record in sorted(records.items())
+        _node(
+            record_id,
+            record,
+            record_digest=record_digests[record_id],
+            execution_states=execution_states,
+        )
+        for record_id, record in sorted(records.items())
     )
     return OclpProjectGraph(
         root=root_path,
         records=records,
+        record_digests=record_digests,
         nodes=_mark_dataset_snapshot_nodes(
             _label_derivation_artifacts(nodes, derivation_edges),
             collection_edges,
@@ -1538,20 +1582,22 @@ def _load_records(
     root: Path,
     *,
     catalog: DuckdbCatalog | None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, str]]:
     records: dict[str, Any] = {}
+    record_digests: dict[str, str] = {}
     for path in _record_paths(root):
         record = _parse_store_record(json.loads(path.read_text()))
-        digest = path.stem
-        if digest in records:
-            raise ValueError(f"Duplicate OCLP record digest {digest} under {root}")
-        records[digest] = record
+        record_digest = path.stem
+        if record.id in records:
+            raise ValueError(f"Duplicate OCLP record ID {record.id} under {root}")
+        records[record.id] = record
+        record_digests[record.id] = record_digest
     if catalog is not None:
         # Ingest the already-parsed snapshot. Returning it rather than
         # catalog.records() retains legacy empty-profile records without
         # weakening current SDK producer validation.
         catalog.ingest(records.values())
-    return records
+    return records, record_digests
 
 
 def _parse_store_record(value: dict[str, Any]) -> Any:
@@ -1560,8 +1606,9 @@ def _parse_store_record(value: dict[str, Any]) -> Any:
     Early producer records serialized ``profiles: {}``. Current Core producers
     emit ``null`` when no profile is bound, and strict parsing rejects the
     former. CYCLOPS accepts the historical shape only at this storage-read
-    boundary, then restores it on an otherwise parsed model so its original
-    digest and every existing reference remain valid.
+    boundary, then restores it on an otherwise parsed model while preserving
+    its original canonical bytes. References resolve by record UUID, not by
+    that local integrity digest.
     """
 
     if value.get("profiles") != {}:
@@ -1574,14 +1621,7 @@ def _parse_store_record(value: dict[str, Any]) -> Any:
 
 
 def _validate_project_records(records: dict[str, Any]) -> None:
-    """Validate explicit bindings against the store's immutable file digests.
-
-    Current records have a filename equal to their canonical record digest. A
-    few historic records predate the mandatory ``profiles: null`` wire
-    field, so recomputing their digest with the current SDK would change their
-    identity. Their content-addressed filename remains the authoritative local
-    identity for this explorer projection.
-    """
+    """Validate explicit bindings against the Core UUID identity map."""
 
     def require(
         reference: RecordReference,
@@ -1589,28 +1629,19 @@ def _validate_project_records(records: dict[str, Any]) -> None:
         kind: str | tuple[str, ...],
         label: str,
     ) -> str:
-        if reference.digest is None:
-            raise ValueError(f"{label} must include a record digest")
-        digest = reference.digest.value
-        target = records.get(digest)
+        record_id = reference.id
+        target = records.get(record_id)
         if target is None:
             raise ValueError(f"{label} does not resolve in this record set")
         expected_kinds = (kind,) if isinstance(kind, str) else kind
         if target.kind not in expected_kinds:
             expected_label = " or ".join(expected_kinds)
             raise ValueError(f"{label} must resolve to a {expected_label}, got {target.kind}")
-        if target.id != reference.id:
-            raise ValueError(f"{label} ID does not match its resolved record")
-        return digest
+        return record_id
 
     derivation: dict[str, set[str]] = {}
-    execution_ids: dict[str, list[str]] = {}
     orchestration: dict[str, set[str]] = {}
-    for digest, record in records.items():
-        if record.kind == "execution":
-            execution_ids.setdefault(record.id, []).append(digest)
-
-    for digest, record in records.items():
+    for record_id, record in records.items():
         if record.kind == "computation":
             implementation = record.implementation
             if implementation.artifact is not None:
@@ -1651,7 +1682,7 @@ def _validate_project_records(records: dict[str, Any]) -> None:
                     kind=("artifact", "artifact_set"),
                     label=f"Execution {record.id} input {port!r}",
                 )
-                derivation.setdefault(input_digest, set()).add(digest)
+                derivation.setdefault(input_digest, set()).add(record_id)
         for port, references in (record.outputs or {}).items():
             for reference in references:
                 output_digest = require(
@@ -1659,22 +1690,16 @@ def _validate_project_records(records: dict[str, Any]) -> None:
                     kind=("artifact", "artifact_set"),
                     label=f"Execution {record.id} output {port!r}",
                 )
-                derivation.setdefault(digest, set()).add(output_digest)
+                derivation.setdefault(record_id, set()).add(output_digest)
         parent = record.parent_execution
         if parent is None:
             continue
-        if parent.digest is not None:
-            parent_digest = require(
-                parent,
-                kind="execution",
-                label=f"Execution {record.id} parent_execution",
-            )
-        else:
-            matches = execution_ids.get(parent.id, [])
-            if len(matches) != 1:
-                raise ValueError(f"Execution {record.id} parent_execution is ambiguous or missing")
-            parent_digest = matches[0]
-        orchestration.setdefault(parent_digest, set()).add(digest)
+        parent_id = require(
+            parent,
+            kind="execution",
+            label=f"Execution {record.id} parent_execution",
+        )
+        orchestration.setdefault(parent_id, set()).add(record_id)
 
     _raise_on_cycle(derivation, label="derivation")
     _raise_on_cycle(orchestration, label="orchestration")
@@ -1705,22 +1730,25 @@ def _record_paths(root: Path) -> Iterable[Path]:
 
 
 def _node(
-    digest: str,
+    record_id: str,
     record: Any,
     *,
+    record_digest: str,
     execution_states: dict[str, _InvocationExecutionSummary],
 ) -> dict[str, Any]:
     node = {
-        "id": digest,
+        "id": record_id,
         "kind": record.kind,
         "record_id": record.id,
         "label": _node_label(record),
-        "digest": f"sha256:{digest}",
+        # Canonical JSON hash is catalog integrity metadata only. Graph
+        # identity and Core references use the UUID in ``id``.
+        "record_digest": f"sha256:{record_digest}",
     }
     if record.kind == "execution":
         # Execution records remain immutable. Its status is a read-only
         # CYCLOPS projection from the terminal lifecycle Event.
-        node["status"] = execution_states[digest].status
+        node["status"] = execution_states[record_id].status
     elif record.kind == "event":
         node["timeline_at"] = _timestamp(record.occurred_at)
         node["timeline_sequence"] = str(record.sequence)
@@ -1778,8 +1806,8 @@ def _invocation_summaries(records: dict[str, Any]) -> dict[str, _InvocationSumma
     for digest, record in records.items():
         if record.kind != "execution":
             continue
-        computation_digest = _reference_digest(record.computation)
-        computation = records.get(computation_digest) if computation_digest else None
+        computation_id = _reference_id(record.computation)
+        computation = records.get(computation_id) if computation_id else None
         locator = record.computation.id
         if computation is not None and computation.kind == "computation":
             locator = computation.implementation.locator
@@ -1865,35 +1893,32 @@ def _display_locator(locator: str) -> str:
 
 
 def _events_by_invocation(records: dict[str, Any]) -> dict[str, list[Any]]:
-    invocation_ids = {
-        record.id: digest for digest, record in records.items() if record.kind == "execution"
-    }
     events_by_invocation: dict[str, list[Any]] = {}
     for record in records.values():
         if record.kind != "event":
             continue
-        digest = _invocation_reference_digest(record.execution, records, invocation_ids)
-        if digest is not None:
-            events_by_invocation.setdefault(digest, []).append(record)
+        execution_id = _invocation_reference_id(record.execution, records)
+        if execution_id is not None:
+            events_by_invocation.setdefault(execution_id, []).append(record)
     return events_by_invocation
 
 
 def _record_key(records: dict[str, Any], target: Any) -> str:
-    """Return a store record's immutable filename digest for deterministic ties."""
+    """Return a record UUID for deterministic ties."""
 
-    return next(digest for digest, record in records.items() if record is target)
+    return next(record_id for record_id, record in records.items() if record is target)
 
 
 def _invocation_timeline(record: Any, events: list[Any]) -> _InvocationTimeline:
-    binding = (record.profiles or {}).get(LIFECYCLE_PROFILE)
+    binding = (record.profiles or {}).get(RUN_PROFILE)
     if binding is not None:
         try:
-            timeline = lifecycle_timeline(binding, events)
+            timeline = run_timeline(binding, events)
         except (ValidationError, ValueError):
             pass
         else:
             return _InvocationTimeline(
-                kind="lifecycle",
+                kind="run",
                 started_at=timeline.started_at,
                 completed_at=timeline.completed_at,
                 first_event_at=min((event.occurred_at for event in events), default=None),
@@ -1906,18 +1931,6 @@ def _invocation_timeline(record: Any, events: list[Any]) -> _InvocationTimeline:
         first_event_at=min(event.occurred_at for event in events),
         last_event_at=max(event.occurred_at for event in events),
     )
-
-
-def _record_lifecycle_run_id(record: Any) -> str | None:
-    """Return a valid lifecycle run ID claimed by any Core record."""
-
-    binding_data = (record.profiles or {}).get(LIFECYCLE_PROFILE)
-    if binding_data is None:
-        return None
-    try:
-        return LifecycleBinding.model_validate(binding_data).run_id
-    except ValidationError:
-        return None
 
 
 def _timestamp(value: datetime | None) -> str | None:
@@ -1952,7 +1965,7 @@ def _computation_label(display_names: list[str], execution_count: int) -> str:
 
 
 def _run_label(display_name: str, run_identifier: str) -> str:
-    """Describe a legacy root Execution without treating its digest as identity."""
+    """Describe a legacy root Execution without treating its UUID as a name."""
 
     return f"{display_name} · {run_identifier}"
 
@@ -1982,7 +1995,7 @@ def _aggregate_run_timeline(
         value.last_event_at for value in values if value.last_event_at is not None
     ]
     return _InvocationTimeline(
-        kind="lifecycle" if all(value.kind == "lifecycle" for value in values) else "generic",
+        kind="run" if all(value.kind == "run" for value in values) else "generic",
         started_at=min(started_at, default=None),
         completed_at=max(completed_at, default=None),
         first_event_at=min(first_event_at, default=None),
@@ -2050,26 +2063,36 @@ def _reference_edges(records: dict[str, Any]) -> Iterable[dict[str, str]]:
     seen: set[tuple[str, str, str]] = set()
 
     def emit(source: str, reference: RecordReference, relation: str) -> None:
-        if reference.digest is None or reference.digest.value not in records:
+        if reference.id not in records:
             return
-        edge = (source, reference.digest.value, relation)
+        edge = (source, reference.id, relation)
         if edge not in seen:
             seen.add(edge)
             yieldable.append(
                 {
-                    "id": f"{source}:{relation}:{reference.digest.value}",
+                    "id": f"{source}:{relation}:{reference.id}",
                     "source": source,
-                    "target": reference.digest.value,
+                    "target": reference.id,
                     "relation": relation,
                 }
             )
 
     yieldable: list[dict[str, str]] = []
-    invocation_ids = {
-        record.id: digest for digest, record in records.items() if record.kind == "execution"
-    }
     for digest, record in records.items():
-        if record.kind == "artifact_set":
+        if record.kind == "artifact":
+            binding_data = (record.profiles or {}).get(RELEASE_MANIFEST_PROFILE)
+            if binding_data is not None:
+                try:
+                    binding = ReleaseManifestBinding.model_validate(binding_data)
+                except ValidationError:
+                    binding = None
+                if (
+                    binding is not None
+                    and binding.artifact_set.id in records
+                    and records[binding.artifact_set.id].kind == "artifact_set"
+                ):
+                    emit(digest, binding.artifact_set, "release-manifest")
+        elif record.kind == "artifact_set":
             for member in record.members:
                 emit(digest, member.artifact, "contains")
         elif record.kind == "computation":
@@ -2078,16 +2101,12 @@ def _reference_edges(records: dict[str, Any]) -> Iterable[dict[str, str]]:
         elif record.kind == "execution":
             emit(digest, record.computation, "computation")
             if record.parent_execution is not None:
-                parent_digest = _invocation_reference_digest(
-                    record.parent_execution,
-                    records,
-                    invocation_ids,
-                )
-                if parent_digest is not None:
+                parent_id = _invocation_reference_id(record.parent_execution, records)
+                if parent_id is not None:
                     yieldable.append(
                         {
-                            "id": f"{parent_digest}:orchestrates:{digest}",
-                            "source": parent_digest,
+                            "id": f"{parent_id}:orchestrates:{digest}",
+                            "source": parent_id,
                             "target": digest,
                             "relation": "orchestrates",
                         }
@@ -2107,16 +2126,12 @@ def _reference_edges(records: dict[str, Any]) -> Iterable[dict[str, str]]:
     return sorted(yieldable, key=lambda edge: (edge["relation"], edge["id"]))
 
 
-def _invocation_reference_digest(
+def _invocation_reference_id(
     reference: RecordReference,
     records: dict[str, Any],
-    invocation_ids: dict[str, str],
 ) -> str | None:
-    if reference.digest is not None:
-        digest = reference.digest.value
-        target = records.get(digest)
-        return digest if target is not None and target.id == reference.id else None
-    return invocation_ids.get(reference.id)
+    target = records.get(reference.id)
+    return reference.id if target is not None and target.kind == "execution" else None
 
 
 def _derivation_edges(records: dict[str, Any]) -> Iterable[dict[str, str]]:
@@ -2151,42 +2166,38 @@ def _collection_edges(root: Path, records: dict[str, Any]) -> Iterable[dict[str,
     """Return generic set and dataset-profile membership overlays."""
 
     edges: list[dict[str, str]] = []
-    for artifact_set_digest, record in records.items():
+    for artifact_set_id, record in records.items():
         if record.kind != "artifact_set":
             continue
         for member in record.members:
-            if member.artifact.digest is None:
-                continue
-            artifact_digest = member.artifact.digest.value
-            if artifact_digest not in records:
+            artifact_id = member.artifact.id
+            if artifact_id not in records:
                 continue
             edges.append(
                 {
-                    "id": f"{artifact_set_digest}:contains:{artifact_digest}",
-                    "source": artifact_set_digest,
-                    "target": artifact_digest,
+                    "id": f"{artifact_set_id}:contains:{artifact_id}",
+                    "source": artifact_set_id,
+                    "target": artifact_id,
                     "relation": "contains",
                     "label": member.role or member.name,
                 }
             )
-    for snapshot_digest, record in records.items():
+    for snapshot_id, record in records.items():
         if record.kind != "artifact" or DATASET_SNAPSHOT_PROFILE not in (record.profiles or {}):
             continue
         manifest = _load_dataset_snapshot_manifest(root, record)
         if manifest is None:
             continue
         for partition in manifest.partitions:
-            if partition.artifact.digest is None:
-                continue
-            artifact_digest = partition.artifact.digest.value
-            target = records.get(artifact_digest)
-            if target is None or target.kind != "artifact" or target.id != partition.artifact.id:
+            artifact_id = partition.artifact.id
+            target = records.get(artifact_id)
+            if target is None or target.kind != "artifact":
                 continue
             edges.append(
                 {
-                    "id": f"{snapshot_digest}:dataset-partition:{artifact_digest}",
-                    "source": snapshot_digest,
-                    "target": artifact_digest,
+                    "id": f"{snapshot_id}:dataset-partition:{artifact_id}",
+                    "source": snapshot_id,
+                    "target": artifact_id,
                     "relation": "dataset-partition",
                     "label": partition.name,
                 }
@@ -2226,32 +2237,32 @@ def _append_derivation_edge(
     relation: str,
     label: str,
 ) -> None:
-    source_digest = _reference_digest(source)
-    target_digest = _reference_digest(target)
-    if source_digest is None or target_digest is None:
+    source_id = _reference_id(source)
+    target_id = _reference_id(target)
+    if source_id is None or target_id is None:
         return
-    if source_digest not in records or target_digest not in records:
+    if source_id not in records or target_id not in records:
         return
     edges.append(
         {
-            "id": f"{source_digest}:{relation}:{target_digest}",
-            "source": source_digest,
-            "target": target_digest,
+            "id": f"{source_id}:{relation}:{target_id}",
+            "source": source_id,
+            "target": target_id,
             "relation": relation,
             "label": label,
         }
     )
 
 
-def _reference_digest(value: str | RecordReference) -> str | None:
+def _reference_id(value: str | RecordReference) -> str | None:
     if isinstance(value, str):
         return value
-    return value.digest.value if value.digest is not None else None
+    return value.id
 
 
 def _references_in_json(value: Any) -> Iterable[RecordReference]:
     if isinstance(value, dict):
-        if set(value).issuperset({"id", "digest"}):
+        if set(value) == {"id"}:
             try:
                 yield RecordReference.model_validate(value)
             except ValueError:

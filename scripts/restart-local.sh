@@ -8,7 +8,7 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 explorer_root="$(cd -- "$script_dir/.." && pwd)"
-oclp_dir="${OCLP_DOGFOOD_DIR:-/Users/evanzamir/projects/oclp-python/examples/bike-demand-service/data/oclp-0.2-evidence}"
+oclp_dir="${OCLP_DOGFOOD_DIR:-/Users/evanzamir/projects/oclp-python/examples/bike-demand-service/data/oclp-0.3}"
 oclp_python_source="${OCLP_PYTHON_SOURCE:-/Users/evanzamir/projects/oclp-python/src}"
 api_port=8002
 frontend_port=5175

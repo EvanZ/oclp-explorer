@@ -25,6 +25,7 @@ import { GIFEncoder, applyPalette, quantize } from "gifenc";
 import {
   Activity,
   Binary,
+  BookOpen,
   Brain,
   BrainCircuit,
   Braces,
@@ -32,6 +33,7 @@ import {
   CircleX,
   Cog,
   Database,
+  ExternalLink,
   File,
   FileCode2,
   FileInput,
@@ -171,7 +173,7 @@ const TIMELINE_TRACK_KINDS = [
   "evidence",
   "output",
 ] as const;
-const GRAPH_LAYOUT_VERSION = "elk-layered-causal-v6-preserve-collection-bridges";
+const GRAPH_LAYOUT_VERSION = "elk-layered-causal-v8-lineage-provenance";
 const ELK_LAYOUT_OPTIONS = {
   "elk.algorithm": "layered",
   "elk.direction": "RIGHT",
@@ -179,7 +181,11 @@ const ELK_LAYOUT_OPTIONS = {
   "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
   "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
   "elk.spacing.nodeNode": "56",
-  "elk.layered.spacing.nodeNodeBetweenLayers": "190",
+  // A run contains an alternating Artifact → Computation → Execution graph.
+  // The old 190px inter-layer gap made a correct 11-layer run almost five
+  // thousand pixels wide, forcing fit-to-view to reduce every card to an
+  // unreadable thumbnail. Keep a clear causal gap without wasting the canvas.
+  "elk.layered.spacing.nodeNodeBetweenLayers": "90",
   "elk.spacing.edgeNode": "36",
 };
 const TIMELINE_TICK_STEPS_MS = [
@@ -218,7 +224,7 @@ type RecordNodeData = {
 type LifecycleGroupNodeData = {
   title?: string;
   label: string;
-  recordCount: number;
+  countLabel: string;
 };
 type NodePositionsByScope = Record<string, Record<string, XYPosition>>;
 type BaseGraphView = "run" | "derivation" | "timeline";
@@ -326,12 +332,10 @@ function LifecycleGroupNode({ data }: NodeProps) {
     <div className="lifecycle-group-node">
       <div className="lifecycle-group-title">
         <Activity aria-hidden="true" size={18} strokeWidth={2.2} />
-        <span>{group.title ?? "Lifecycle"}</span>
+        <span>{group.title ?? "Run"}</span>
       </div>
       <span className="lifecycle-group-label">{group.label}</span>
-      <span className="lifecycle-group-count">
-        {group.recordCount} {group.recordCount === 1 ? "record" : "records"}
-      </span>
+      <span className="lifecycle-group-count">{group.countLabel}</span>
     </div>
   );
 }
@@ -692,7 +696,7 @@ function statusSummary(statusCounts: Record<string, number> | undefined): string
 }
 
 function timelineSummary(run: Run): string | null {
-  if (run.timeline.kind === "lifecycle" && run.timeline.started_at) {
+  if (run.timeline.kind === "run" && run.timeline.started_at) {
     return "started " + new Date(run.timeline.started_at).toLocaleString();
   }
   if (run.timeline.first_event_at) {
@@ -1018,7 +1022,7 @@ function lifecycleGrouping(
   for (const group of visibleGroups) {
     // Presentation boundaries may be nested: an inner Lifecycle owns its
     // materialization while an outer Lineage can encompass that Lifecycle
-    // plus a sibling inference service.  They are drawn as borders, not
+    // plus a sibling inference service. They are drawn as borders, not
     // React Flow parent nodes, so retaining shared members is both safe and
     // necessary for the outer boundary to actually enclose the inner graph.
     memberIdsByGroup.set(group.id, group.member_ids);
@@ -1037,10 +1041,54 @@ function mergeProvenanceOverlay(
   // itself (at their asserted time or in its explicit untimed column), so
   // adding overlay bindings would still make the Provenance switch change the
   // base Data DAG.
-  const provenanceNodes = provenance.nodes.filter((node) => node.layer === "provenance");
+  const primaryNodeIds = new Set([
+    ...graph.nodes.map((node) => node.id),
+    ...graph.collection_nodes.map((node) => node.id),
+  ]);
+  const provenanceNodesById = new Map(
+    provenance.nodes
+      .filter((node) => node.layer === "provenance")
+      .map((node) => [node.id, node]),
+  );
   const provenanceEdges = provenance.edges.filter(
     (edge) => edge.relation !== "consumes" && edge.relation !== "produces",
   );
+  // An overlay may be broader than the primary canvas—for example, a
+  // backend can return context for a release-connected sibling run. Only
+  // retain provenance that is actually attached to the graph the user
+  // selected. This prevents orphaned Event/Evidence cards from appearing in
+  // a corner without their owning Execution.
+  const attachedProvenanceIds = new Set<string>();
+  let attachedChanged = true;
+  while (attachedChanged) {
+    attachedChanged = false;
+    for (const edge of provenanceEdges) {
+      const sourceAnchored =
+        primaryNodeIds.has(edge.source) || attachedProvenanceIds.has(edge.source);
+      const targetAnchored =
+        primaryNodeIds.has(edge.target) || attachedProvenanceIds.has(edge.target);
+      if (
+        sourceAnchored &&
+        provenanceNodesById.has(edge.target) &&
+        !attachedProvenanceIds.has(edge.target)
+      ) {
+        attachedProvenanceIds.add(edge.target);
+        attachedChanged = true;
+      }
+      if (
+        targetAnchored &&
+        provenanceNodesById.has(edge.source) &&
+        !attachedProvenanceIds.has(edge.source)
+      ) {
+        attachedProvenanceIds.add(edge.source);
+        attachedChanged = true;
+      }
+    }
+  }
+  const provenanceNodes = [...attachedProvenanceIds].flatMap((id) => {
+    const node = provenanceNodesById.get(id);
+    return node ? [node] : [];
+  });
   const nodes = [...graph.nodes, ...provenanceNodes];
   const nodeIds = new Set([
     ...nodes.map((node) => node.id),
@@ -1103,10 +1151,13 @@ function inferenceServiceSummary(service: InferenceService): string {
 }
 
 /**
- * Collapse request-private service materializations into one presentation
- * node. The virtual node is intentionally not an OCLP record. Individual
- * requests are opened in the execution-scoped Data DAG from the explorer;
- * the Run lineage overview never silently changes to a request graph.
+ * Collapse request-private service materializations for a Run overview. The
+ * virtual node is intentionally not an OCLP record.
+ *
+ * A service selected from the explorer deliberately bypasses this projection:
+ * that scope must show its actual Computation, Executions, request/response
+ * Artifacts, and their real data-flow edges. Otherwise the selection would
+ * fetch the genuine service graph from the API only to hide it again.
  */
 function projectInferenceServices(graph: GraphPayload | null): GraphPayload | null {
   if (!graph || graph.view !== "run") return graph;
@@ -1122,13 +1173,12 @@ function projectInferenceServices(graph: GraphPayload | null): GraphPayload | nu
   const serviceNodes: GraphNode[] = collapsedServices.map((service) => ({
     id: service.id,
     kind: "inference_service",
-    record_id: service.release_id,
+    record_id: service.release_record_id,
     label: [
       "Inference service",
       service.label,
       "▸ " + inferenceServiceSummary(service),
     ].join("\n"),
-    digest: service.id,
     status: inferenceServiceStatus(service),
   }));
   const serviceEdges: GraphEdge[] = collapsedServices.flatMap((service) =>
@@ -1669,7 +1719,7 @@ function flowNodes(
       data: {
         title: layout.group.title,
         label: layout.group.label,
-        recordCount: layout.memberIds.length,
+        countLabel: layout.memberIds.length + " " + (layout.memberIds.length === 1 ? "record" : "records"),
       },
       selectable: false,
       draggable: false,
@@ -1713,6 +1763,7 @@ const REVERSED_REFERENCE_FLOW_RELATIONS = new Set([
   "event-reference",
   "implementation",
   "input",
+  "release-manifest",
 ]);
 
 function asCausalFlowEdge(edge: GraphEdge): GraphEdge {
@@ -1930,6 +1981,7 @@ export default function App() {
   const [selectedInferenceService, setSelectedInferenceService] = useState<string>();
   const [isLineageScope, setIsLineageScope] = useState(false);
   const [expandedLineages, setExpandedLineages] = useState<Set<string>>(new Set());
+  const [expandedRunTreeIds, setExpandedRunTreeIds] = useState<Set<string>>(new Set());
   const [runFilter, setRunFilter] = useState("");
   const [runStatusFilter, setRunStatusFilter] =
     useState<RunStatusFilter>("all");
@@ -1958,10 +2010,19 @@ export default function App() {
   const [nodePositionsByScope, setNodePositionsByScope] =
     useState<NodePositionsByScope>({});
   const [layoutRequest, setLayoutRequest] = useState(0);
+  // Updating React state with ELK positions and immediately calling
+  // ReactFlow.fitView() fits the *previous* rendered positions. Track the
+  // completed layout separately so the viewport is fitted only after the new
+  // positions have committed to React Flow.
+  const [layoutFitRequest, setLayoutFitRequest] = useState(0);
   const [isAutoArranging, setIsAutoArranging] = useState(false);
   const flow = useRef<ReactFlowInstance | null>(null);
   const graphPanelRef = useRef<HTMLDivElement | null>(null);
   const selectedRecordRequest = useRef<AbortController | null>(null);
+  // Sidebar selections can arrive faster than the API responses they start.
+  // Keep the canvas bound to the most recent selection rather than allowing
+  // a prior Lineage-overview response to overwrite a later Run overview.
+  const graphRequest = useRef(0);
   const didInitialize = useRef(false);
   const completedLayoutRequests = useRef(new Set<string>());
   const theme = GRAPH_THEMES[themeName];
@@ -1986,10 +2047,20 @@ export default function App() {
       : baseView === "derivation"
         ? "Execution data graph"
         : selectedInferenceService
-          ? "Inference service overview"
+          ? "Inference service"
           : isLineageScope
             ? "Lineage overview"
             : "Run overview";
+  const provenanceDisabled =
+    !graph ||
+    (!selectedRun && !selectedInvocation && !selectedInferenceService);
+  const provenanceTitle = isLineageScope
+    ? "Show provenance context for every child materialization in the selected lineage"
+    : selectedInferenceService
+    ? "Show provenance context for every request in the selected inference service"
+    : selectedInvocation
+      ? "Show provenance context for the selected Execution"
+      : "Show provenance context for the selected run";
   const canvasExecutionIds = useMemo<Set<string> | null>(() => {
     if (!hasRunFilter) return null;
     if (!activeLineage || !activeRun) return new Set();
@@ -2003,18 +2074,26 @@ export default function App() {
     );
   }, [activeLineage, activeRun, hasRunFilter, normalizedRunFilter, runStatusFilter]);
   const displayGraph = useMemo(
-    () =>
-      projectInferenceServices(
-        filterGraphToExecutions(
-          mergeProvenanceOverlay(graph, isProvenanceVisible ? provenanceGraph : null),
-          canvasExecutionIds,
-        ),
-      ),
+    () => {
+      const scopedGraph = filterGraphToExecutions(
+        mergeProvenanceOverlay(graph, isProvenanceVisible ? provenanceGraph : null),
+        canvasExecutionIds,
+      );
+      // The service endpoint and a provenance-enabled Lineage already return
+      // an exact materialization. Preserve their real request Executions so
+      // Events and Evidence remain attached. A compact Run overview may still
+      // summarize request-private service work.
+      return selectedInferenceService || (isLineageScope && isProvenanceVisible)
+        ? scopedGraph
+        : projectInferenceServices(scopedGraph);
+    },
     [
       canvasExecutionIds,
       graph,
       isProvenanceVisible,
       provenanceGraph,
+      selectedInferenceService,
+      isLineageScope,
     ],
   );
   const graphNodeById = useMemo(
@@ -2036,6 +2115,8 @@ export default function App() {
     service?: string,
     lineage = false,
   ) => {
+    const request = graphRequest.current + 1;
+    graphRequest.current = request;
     try {
       setError(null);
       const parameters = new URLSearchParams({ view });
@@ -2053,15 +2134,26 @@ export default function App() {
       if (!graphResponse.ok || !healthResponse.ok) {
         throw new Error("CYCLOPS could not load this OCLP store.");
       }
-      setGraph((await graphResponse.json()) as GraphPayload);
-      setSummary((await healthResponse.json()) as Summary);
+      const [nextGraph, nextSummary] = await Promise.all([
+        graphResponse.json() as Promise<GraphPayload>,
+        healthResponse.json() as Promise<Summary>,
+      ]);
+      if (request !== graphRequest.current) return;
+      setGraph(nextGraph);
+      setSummary(nextSummary);
     } catch (loadError) {
+      if (request !== graphRequest.current) return;
       setError((loadError as Error).message);
     }
   }, []);
 
-  const loadProvenanceOverlay = useCallback(async (run?: string, execution?: string) => {
-    if (!run && !execution) {
+  const loadProvenanceOverlay = useCallback(async (
+    run?: string,
+    execution?: string,
+    service?: string,
+    lineage = false,
+  ) => {
+    if (!run && !execution && !service) {
       setProvenanceGraph(null);
       return false;
     }
@@ -2069,6 +2161,8 @@ export default function App() {
       const parameters = new URLSearchParams({ view: "provenance" });
       if (run) parameters.set("run", run);
       if (execution) parameters.set("execution", execution);
+      if (service) parameters.set("service", service);
+      if (lineage) parameters.set("lineage", "true");
       const response = await fetch("/api/graph?" + parameters.toString());
       if (!response.ok) throw new Error("CYCLOPS could not load provenance context.");
       setProvenanceGraph((await response.json()) as GraphPayload);
@@ -2090,6 +2184,10 @@ export default function App() {
         const available = new Set(payload.lineages.map((lineage) => lineage.id));
         return new Set([...current].filter((lineageId) => available.has(lineageId)));
       });
+      setExpandedRunTreeIds((current) => {
+        const available = new Set(payload.runs.map((run) => run.id));
+        return new Set([...current].filter((runId) => available.has(runId)));
+      });
       if (openFirstRun) {
         const firstLineage = payload.lineages[0];
         const first = firstLineage?.runs[0] ?? payload.runs[0];
@@ -2101,6 +2199,7 @@ export default function App() {
         setSelectedInferenceService(undefined);
         setIsLineageScope(false);
         setExpandedLineages(firstLineage ? new Set([firstLineage.id]) : new Set());
+        setExpandedRunTreeIds(first ? new Set([first.id]) : new Set());
         setBaseView("run");
         setIsProvenanceVisible(false);
         setProvenanceGraph(null);
@@ -2121,6 +2220,8 @@ export default function App() {
       if (openFirstRun) {
         await loadRuns(true);
       } else {
+        const selectedService =
+          baseView === "run" ? selectedInferenceService : undefined;
         await Promise.all([
           loadRuns(),
           loadGraph(
@@ -2130,11 +2231,16 @@ export default function App() {
               ? selectedInvocation
               : undefined,
             undefined,
-            undefined,
+            selectedService,
             baseView === "run" && isLineageScope,
           ),
           isProvenanceVisible
-            ? loadProvenanceOverlay(selectedRun, selectedInvocation)
+            ? loadProvenanceOverlay(
+                selectedRun,
+                selectedInvocation,
+                selectedService,
+                isLineageScope,
+              )
             : Promise.resolve(true),
         ]);
       }
@@ -2143,7 +2249,7 @@ export default function App() {
     } finally {
       setIsRefreshing(false);
     }
-  }, [baseView, isLineageScope, isProvenanceVisible, loadGraph, loadProvenanceOverlay, loadRuns, selectedInvocation, selectedRun]);
+  }, [baseView, isLineageScope, isProvenanceVisible, loadGraph, loadProvenanceOverlay, loadRuns, selectedInferenceService, selectedInvocation, selectedRun]);
 
   useEffect(() => {
     if (didInitialize.current) return;
@@ -2218,6 +2324,7 @@ export default function App() {
         // graph's fallback positions and so toggling it off restores the
         // user's previous data-only placement.
         isProvenanceVisible ? "with-provenance" : "without-provenance",
+        isLineageScope ? "lineage" : "child",
         selectedRun ?? "",
         selectedInferenceService ?? "",
         displayGraph?.view === "derivation" || displayGraph?.view === "timeline"
@@ -2226,6 +2333,7 @@ export default function App() {
       ].join(":"),
     [
       displayGraph?.view,
+      isLineageScope,
       isProvenanceVisible,
       selectedInferenceService,
       selectedInvocation,
@@ -2313,9 +2421,7 @@ export default function App() {
             ...current,
             [layoutScope]: positions,
           }));
-          window.requestAnimationFrame(() => {
-            if (!cancelled) flow.current?.fitView({ duration: 260, padding: 0.18 });
-          });
+          setLayoutFitRequest((current) => current + 1);
         })
         .catch(() => {
           if (!cancelled) setError("CYCLOPS could not automatically arrange this graph.");
@@ -2329,6 +2435,24 @@ export default function App() {
       window.cancelAnimationFrame(frame);
     };
   }, [displayGraph, edges, layoutContentKey, layoutRequest, layoutScope, nodes]);
+
+  useEffect(() => {
+    if (!layoutFitRequest) return;
+    let cancelled = false;
+    // Wait for the position update above to be committed, then for React Flow
+    // to measure its moved nodes. A second frame is intentional: fitting in
+    // the promise callback was the source of the stale, mostly blank canvas.
+    const firstFrame = window.requestAnimationFrame(() => {
+      const secondFrame = window.requestAnimationFrame(() => {
+        if (!cancelled) flow.current?.fitView({ duration: 260, padding: 0.18 });
+      });
+      if (cancelled) window.cancelAnimationFrame(secondFrame);
+    });
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(firstFrame);
+    };
+  }, [layoutFitRequest]);
 
   const updateNodePositions = useCallback((changes: NodeChange<Node>[]) => {
     const isTimeline = displayGraph?.view === "timeline";
@@ -2389,8 +2513,13 @@ export default function App() {
   }, []);
 
   const selectNode: NodeMouseHandler = useCallback(async (_event, node) => {
-    // Lifecycle boundaries are structural React Flow nodes, not OCLP records.
-    // Treat a click on one exactly like a click on the empty canvas.
+    // Lifecycle boundaries and collapsed lifecycle cards are structural
+    // CYCLOPS presentation, not OCLP records. Treat a click on either exactly
+    // like a click on the empty canvas.
+    if (node.id.startsWith("lifecycle-summary:")) {
+      clearSelectedRecord();
+      return;
+    }
     const inferenceService = (displayGraph?.inference_services ?? []).find(
       (service) => service.id === node.id,
     );
@@ -2450,12 +2579,12 @@ export default function App() {
 
   useEffect(() => () => selectedRecordRequest.current?.abort(), []);
 
-  const toggleCollection = useCallback((digest: string) => {
-    if (!isArtifactCollection(graphNodeById.get(digest))) return;
+  const toggleCollection = useCallback((recordId: string) => {
+    if (!isArtifactCollection(graphNodeById.get(recordId))) return;
     setExpandedCollections((current) => {
       const next = new Set(current);
-      if (next.has(digest)) next.delete(digest);
-      else next.add(digest);
+      if (next.has(recordId)) next.delete(recordId);
+      else next.add(recordId);
       return next;
     });
   }, [graphNodeById]);
@@ -2469,8 +2598,17 @@ export default function App() {
     });
   }, []);
 
+  const toggleRunTree = useCallback((runId: string) => {
+    setExpandedRunTreeIds((current) => {
+      const next = new Set(current);
+      if (next.has(runId)) next.delete(runId);
+      else next.add(runId);
+      return next;
+    });
+  }, []);
+
   const toggleSelectedCollection = useCallback(() => {
-    if (selected) toggleCollection(selected.digest);
+    if (selected) toggleCollection(selected.id);
   }, [selected, toggleCollection]);
 
   const toggleCollectionNode: NodeMouseHandler = useCallback(
@@ -2486,7 +2624,7 @@ export default function App() {
   );
 
   const selectedCollection = selected
-    ? isArtifactCollection(graphNodeById.get(selected.digest))
+    ? isArtifactCollection(graphNodeById.get(selected.id))
     : false;
 
   const copySelectedRecord = useCallback(async () => {
@@ -2582,7 +2720,7 @@ export default function App() {
   }, [displayGraph, graph, theme.canvasBackground]);
 
   const showTimeline = useCallback(() => {
-    if (!selectedRun) {
+    if (!selectedRun || isLineageScope) {
       setError("Select a run or Execution in the explorer before opening its timeline.");
       return;
     }
@@ -2590,7 +2728,14 @@ export default function App() {
     setIsLineageScope(false);
     setBaseView("timeline");
     void loadGraph("timeline", selectedRun, selectedInvocation);
-  }, [loadGraph, selectedInvocation, selectedRun]);
+  }, [isLineageScope, loadGraph, selectedInvocation, selectedRun]);
+
+  const showSelectedGraph = useCallback(() => {
+    if (!selectedRun || isLineageScope) return;
+    const view = selectedInvocation ? "derivation" : "run";
+    setBaseView(view);
+    void loadGraph(view, selectedRun, selectedInvocation);
+  }, [isLineageScope, loadGraph, selectedInvocation, selectedRun]);
 
   const toggleProvenance = useCallback(() => {
     if (isProvenanceVisible) {
@@ -2598,23 +2743,24 @@ export default function App() {
       setProvenanceGraph(null);
       return;
     }
-    if (!selectedRun && !selectedInvocation) {
-      setError("Select a lifecycle run or an Execution before showing provenance context.");
-      return;
-    }
-    if (selectedInferenceService) {
-      setError("Expand the inference service and select a request to inspect its provenance.");
+    if (!selectedRun && !selectedInvocation && !selectedInferenceService) {
+      setError("Select a run, inference service, or Execution before showing provenance context.");
       return;
     }
     setIsProvenanceVisible(true);
-    void loadProvenanceOverlay(selectedRun, selectedInvocation).then((loaded) => {
+    void loadProvenanceOverlay(
+      selectedRun,
+      selectedInvocation,
+      selectedInferenceService,
+      isLineageScope,
+    ).then((loaded) => {
       if (!loaded) setIsProvenanceVisible(false);
     });
-  }, [isProvenanceVisible, loadProvenanceOverlay, selectedInferenceService, selectedInvocation, selectedRun]);
+  }, [isLineageScope, isProvenanceVisible, loadProvenanceOverlay, selectedInferenceService, selectedInvocation, selectedRun]);
 
   useEffect(() => {
     setCopied(false);
-  }, [selected?.digest]);
+  }, [selected?.id]);
 
   const showLineage = useCallback(() => {
     if (selected) {
@@ -2628,7 +2774,7 @@ export default function App() {
         view,
         selectedRun,
         selectedInvocation,
-        "/api/lineage/" + selected.digest + "?" + parameters.toString(),
+        "/api/lineage/" + selected.id + "?" + parameters.toString(),
       );
     }
   }, [graph?.view, loadGraph, selected, selectedInvocation, selectedRun]);
@@ -2645,11 +2791,12 @@ export default function App() {
     setExpandedLineages((current) => new Set([...current, lineageId]));
     setExpandedCollections(new Set());
     setBaseView("run");
+    setIsProvenanceVisible(false);
+    setProvenanceGraph(null);
+    setError(null);
     void loadGraph("run", run?.id, undefined, undefined, undefined, true);
-    if (isProvenanceVisible) {
-      void loadProvenanceOverlay(run?.id);
-    }
-  }, [clearSelectedRecord, isProvenanceVisible, lineages, loadGraph, loadProvenanceOverlay]);
+    setLayoutRequest((current) => current + 1);
+  }, [clearSelectedRecord, lineages, loadGraph]);
 
   const selectRun = useCallback((lineageId: string, runId: string) => {
     const selected = runId || undefined;
@@ -2660,6 +2807,7 @@ export default function App() {
     setSelectedInferenceService(undefined);
     setIsLineageScope(false);
     setExpandedLineages((current) => new Set([...current, lineageId]));
+    if (selected) setExpandedRunTreeIds((current) => new Set([...current, selected]));
     setExpandedCollections(new Set());
     setBaseView("run");
     void loadGraph("run", selected);
@@ -2679,6 +2827,7 @@ export default function App() {
     setSelectedInferenceService(undefined);
     setIsLineageScope(false);
     setExpandedLineages((current) => new Set([...current, lineageId]));
+    setExpandedRunTreeIds((current) => new Set([...current, runId]));
     setExpandedCollections(new Set());
     setBaseView("derivation");
     void loadGraph("derivation", runId, executionId || undefined);
@@ -2700,12 +2849,12 @@ export default function App() {
     setExpandedLineages((current) => new Set([...current, lineageId]));
     setExpandedCollections(new Set());
     setBaseView("run");
-    // The service heading has one stable compact overview: its real release
-    // ArtifactSet handed off to the virtual service roll-up. This is a
-    // deliberate service selection, not a side effect of expanding the
-    // sidebar or selecting a request Execution.
+    // The service endpoint returns the actual serving materialization. Keep
+    // this distinct from a broad lineage overview, where request-private
+    // nodes may be collapsed into a presentation summary.
     setIsProvenanceVisible(false);
     setProvenanceGraph(null);
+    setError(null);
     void loadGraph("run", firstRequest.run_id, undefined, undefined, service.id);
   }, [clearSelectedRecord, loadGraph]);
 
@@ -2744,6 +2893,18 @@ export default function App() {
     () => filteredLineages.reduce((count, lineage) => count + lineage.matchingExecutionCount, 0),
     [filteredLineages],
   );
+  const lifecycleRunCount = useMemo(
+    () => lineages.reduce((count, lifecycle) => count + lifecycle.run_count, 0),
+    [lineages],
+  );
+  const inferenceServiceCount = useMemo(
+    () =>
+      lineages.reduce(
+        (count, lifecycle) => count + lifecycle.inference_services.length,
+        0,
+      ),
+    [lineages],
+  );
 
   useEffect(() => {
     if (!hasRunFilter) return;
@@ -2766,6 +2927,24 @@ export default function App() {
         <div>
           <p className="eyebrow">OCLP Project Explorer</p>
           <h1>CYCLOPS</h1>
+          <nav aria-label="Cyclops resources" className="project-resource-links">
+            <a
+              href="https://github.com/EvanZ/oclp-explorer"
+              rel="noreferrer"
+              target="_blank"
+            >
+              <ExternalLink aria-hidden="true" size={13} />
+              GitHub
+            </a>
+            <a
+              href="https://evanz.github.io/oclp-explorer/"
+              rel="noreferrer"
+              target="_blank"
+            >
+              <BookOpen aria-hidden="true" size={13} />
+              Docs
+            </a>
+          </nav>
         </div>
         <div className="project-summary">
           <strong>{summary?.record_count ?? "—"} records</strong>
@@ -2791,7 +2970,7 @@ export default function App() {
             </button>
             <button
               aria-label="Export the current graph as an animated GIF"
-              className="export-gif"
+              className={"export-gif" + (isExportingGif ? " is-busy" : "")}
               disabled={!graph || isExportingGif}
               onClick={() => void exportFlowGif()}
               title="Export the complete current graph with animated data-flow edges"
@@ -2800,7 +2979,7 @@ export default function App() {
             </button>
             <button
               aria-label="Automatically arrange the current graph"
-              className="auto-arrange"
+              className={"auto-arrange" + (isAutoArranging ? " is-busy" : "")}
               disabled={!displayGraph || displayGraph.view === "timeline" || isAutoArranging}
               onClick={autoArrange}
               title={
@@ -2815,10 +2994,19 @@ export default function App() {
               <button
                 aria-pressed={baseView === "timeline"}
                 className={baseView === "timeline" ? "is-active" : undefined}
-                disabled={!selectedRun}
-                onClick={showTimeline}
+                disabled={!selectedRun || isLineageScope}
+                onClick={baseView === "timeline" ? showSelectedGraph : showTimeline}
+                title={
+                  isLineageScope
+                    ? "Select a child run or inference service before opening its timeline"
+                    : baseView === "timeline"
+                      ? selectedInvocation
+                        ? "Return to the selected Execution data graph"
+                        : "Return to the selected run graph"
+                      : "View the selected run as a timeline"
+                }
               >
-                Timeline
+                {baseView === "timeline" ? "Run graph" : "Timeline"}
               </button>
             </div>
             <button
@@ -2827,14 +3015,10 @@ export default function App() {
               className={
                 "provenance-switch" + (isProvenanceVisible ? " is-active" : "")
               }
-              disabled={!graph || (!selectedRun && !selectedInvocation)}
+              disabled={provenanceDisabled}
               onClick={toggleProvenance}
               role="switch"
-              title={
-                selectedInvocation
-                  ? "Show provenance context for the selected Execution"
-                  : "Show provenance context for the selected lifecycle run"
-              }
+              title={provenanceTitle}
             >
               <span aria-hidden="true" className="provenance-switch-track">
                 <span className="provenance-switch-thumb" />
@@ -2855,11 +3039,15 @@ export default function App() {
         {isLineageExplorerVisible ? (
         <aside className="run-panel">
           <div className="run-panel-heading">
-            <p className="eyebrow">Lineage explorer</p>
+            <p className="eyebrow">Run explorer</p>
             <div className="run-panel-actions">
               <span>
                 {lineages.length} lineage{lineages.length === 1 ? "" : "s"}
-                {" · "}{runs.length} run{runs.length === 1 ? "" : "s"}
+                {" · "}{lifecycleRunCount} run{lifecycleRunCount === 1 ? "" : "s"}
+                {inferenceServiceCount
+                  ? " · " + inferenceServiceCount + " inference service" +
+                    (inferenceServiceCount === 1 ? "" : "s")
+                  : ""}
               </span>
               <button
                 aria-label="Refresh OCLP project"
@@ -2875,10 +3063,10 @@ export default function App() {
                 {isRefreshing ? "…" : "↻"}
               </button>
               <button
-                aria-label="Hide Lineage Explorer"
+                aria-label="Hide Run Explorer"
                 className="run-panel-visibility-toggle"
                 onClick={() => setIsLineageExplorerVisible(false)}
-                title="Hide Lineage Explorer"
+                title="Hide Run Explorer"
               >
                 <PanelLeftClose aria-hidden="true" size={15} />
               </button>
@@ -2909,7 +3097,7 @@ export default function App() {
               {" in "}{filteredLineages.length} lineage{filteredLineages.length === 1 ? "" : "s"}
             </p>
           ) : null}
-          <div className="run-tree" role="tree" aria-label="OCLP run lineages">
+          <div className="run-tree" role="tree" aria-label="OCLP runs">
             {filteredLineages.map(({ lineage, runs: lineageRuns }) => {
               const expanded = expandedLineages.has(lineage.id);
               return (
@@ -2936,7 +3124,7 @@ export default function App() {
                     >
                       <span>Lineage · {lineage.label}</span>
                       <small>
-                        {lineage.root_count} run{lineage.root_count === 1 ? "" : "s"}
+                        {lineage.run_count} run{lineage.run_count === 1 ? "" : "s"}
                         {lineage.inference_services.length
                           ? " · " + lineage.inference_services.length + " inference service" +
                             (lineage.inference_services.length === 1 ? "" : "s")
@@ -2948,26 +3136,45 @@ export default function App() {
                   </div>
                   {expanded ? (
                     <div className="lineage-tree-runs" role="group">
-                      {lineageRuns.map(({ run, executions }) => (
-                        <section className="lineage-tree-run" key={run.id}>
-                          <button
-                            aria-current={selectedRun === run.id && baseView === "run" ? "true" : undefined}
-                            className={
-                              "lineage-tree-run-heading" +
-                              (selectedRun === run.id && baseView === "run" ? " is-active" : "")
-                            }
-                            onClick={() => selectRun(lineage.id, run.id)}
-                            title={run.record_id}
-                          >
-                            <span>Run · {run.label}</span>
-                            <small>
-                              {statusSummary(run.status_counts)}
-                              {" · "}{run.artifact_count} artifact{run.artifact_count === 1 ? "" : "s"}
-                              {timelineSummary(run) ? " · " + timelineSummary(run) : ""}
-                            </small>
-                          </button>
-                          <div className="run-tree-children" role="group">
-                            {executions.map((execution) => (
+                      {lineageRuns.map(({ run, executions }) => {
+                        const expandedRun = expandedRunTreeIds.has(run.id);
+                        return (
+                          <section className="lineage-tree-run" key={run.id}>
+                            <div className="run-tree-heading">
+                              <button
+                                aria-expanded={expandedRun}
+                                aria-label={(expandedRun ? "Collapse " : "Expand ") + run.label}
+                                className="run-tree-disclosure"
+                                onClick={() => toggleRunTree(run.id)}
+                              >
+                                {expandedRun ? "▾" : "▸"}
+                              </button>
+                              <button
+                                aria-current={
+                                  selectedRun === run.id && baseView === "run" && !isLineageScope
+                                    ? "true"
+                                    : undefined
+                                }
+                                className={
+                                  "lineage-tree-run-heading" +
+                                  (selectedRun === run.id && baseView === "run" && !isLineageScope
+                                    ? " is-active"
+                                    : "")
+                                }
+                                onClick={() => selectRun(lineage.id, run.id)}
+                                title={run.record_id}
+                              >
+                                <span>Run · {run.label}</span>
+                                <small>
+                                  {statusSummary(run.status_counts)}
+                                  {" · "}{run.artifact_count} artifact{run.artifact_count === 1 ? "" : "s"}
+                                  {timelineSummary(run) ? " · " + timelineSummary(run) : ""}
+                                </small>
+                              </button>
+                            </div>
+                            {expandedRun ? (
+                              <div className="run-tree-children" role="group">
+                                {executions.map((execution) => (
                               <button
                                 aria-current={selectedInvocation === execution.id ? "true" : undefined}
                                 className={
@@ -3004,10 +3211,12 @@ export default function App() {
                                   ) : null}
                                 </span>
                               </button>
-                            ))}
-                          </div>
-                        </section>
-                      ))}
+                                ))}
+                              </div>
+                            ) : null}
+                          </section>
+                        );
+                      })}
                       {lineage.inference_services.map((service) => {
                         const expandedService = expandedInferenceServiceTreeIds.has(service.id);
                         const requests = service.requests ?? [];
@@ -3024,18 +3233,18 @@ export default function App() {
                               </button>
                               <button
                                 aria-current={
-                                  selectedRun && requests.some((request) => request.run_id === selectedRun)
+                                  selectedInferenceService === service.id && !isLineageScope
                                     ? "true"
                                     : undefined
                                 }
                                 className={
                                   "lineage-tree-run-heading" +
-                                  (selectedRun && requests.some((request) => request.run_id === selectedRun)
+                                  (selectedInferenceService === service.id && !isLineageScope
                                     ? " is-active"
                                     : "")
                                 }
                                 onClick={() => selectInferenceService(lineage.id, service)}
-                                title={service.release_id}
+                                title={service.release_record_id}
                               >
                                 <span>Inference service · {service.label}</span>
                                 <small>{inferenceServiceSummary(service)}</small>
@@ -3092,16 +3301,16 @@ export default function App() {
               );
             })}
             {filteredLineages.length === 0 ? (
-              <p className="run-tree-empty">No matching lineages.</p>
+              <p className="run-tree-empty">No matching runs.</p>
             ) : null}
           </div>
         </aside>
         ) : (
           <button
-            aria-label="Show Lineage Explorer"
+            aria-label="Show Run Explorer"
             className="show-run-panel"
             onClick={() => setIsLineageExplorerVisible(true)}
-            title="Show Lineage Explorer"
+            title="Show Run Explorer"
           >
             <PanelLeftOpen aria-hidden="true" size={18} />
           </button>
@@ -3158,7 +3367,7 @@ export default function App() {
               <p className="record-id">{String(selected.record.id)}</p>
               {selectedCollection ? (
                 <button onClick={toggleSelectedCollection}>
-                  {expandedCollections.has(selected.digest)
+                  {expandedCollections.has(selected.id)
                     ? "Collapse members"
                     : "Expand members"}
                 </button>
@@ -3181,14 +3390,15 @@ export default function App() {
             <p className="record-load-error">{selectedRecordError}</p>
           ) : (
             <p>
-              Select a lineage or run for its lifecycle overview. Select an
-              Execution for its strict Artifact → Execution → Artifact data
-              graph. A Lifecycle boundary contains the run's real Executions,
-              direct Artifacts, ArtifactSets, and Computations without turning
-              orchestration into a flow edge. Timeline is an explicit
-              chronology view; the Provenance switch adds context for the
-              current selection. Double-click a collection to expand or
-              collapse its member Artifacts.
+              {isLineageScope
+                ? "A Lineage overview shows runs connected by real Artifact handoffs."
+                : selectedInferenceService
+                  ? "An inference-service overview shows its exact serving materialization."
+                  : selectedInvocation
+                    ? "An Execution data graph shows its strict Artifact → Execution → Artifact flow."
+                    : "A Run overview shows the selected run's exact materialization."}{" "}
+              Select a record to inspect it. Double-click a collection to
+              expand or collapse its member Artifacts.
             </p>
           )}
           {summary ? <p className="store-root">{summary.root}</p> : null}

@@ -10,8 +10,9 @@ a named release.
 The Lineage explorer is the starting point. It groups real Executions that
 claim the same lifecycle-profile `run_id`; legacy stores fall back to an
 explicit parent-Execution hierarchy. Separate lifecycle runs join one lineage
-only when an explicit produced-and-consumed Artifact handoff connects them. The
-default **Run lineage** shows the selected connected lifecycle and all its
+only through an explicit data handoff: a produced-and-consumed Artifact or
+ArtifactSet, or a directly published lifecycle-owned ArtifactSet consumed by
+another run. The default **Run lineage** shows the selected connected lifecycle and all its
 work. Solid animated edges carry data; no controller Execution is invented for
 run navigation. It does not link unrelated runs simply because they share an
 unproduced input.

@@ -312,8 +312,8 @@ wheels = [
 
 [[package]]
 name = "oclp"
-version = "0.2.0a0"
-source = { git = "https://github.com/EvanZ/oclp-python.git?rev=ff2b4a6#ff2b4a6d12d518fbce22dd46464321904df0de04" }
+version = "0.3.0a0"
+source = { directory = "../oclp-python" }
 dependencies = [
     { name = "jsonschema" },
     { name = "pydantic" },
@@ -324,6 +324,34 @@ dependencies = [
 duckdb = [
     { name = "duckdb" },
 ]
+
+[package.metadata]
+requires-dist = [
+    { name = "catboost", marker = "extra == 'catboost'", specifier = ">=1.2,<2" },
+    { name = "defusedxml", marker = "extra == 'xml'", specifier = ">=0.7,<1" },
+    { name = "duckdb", marker = "extra == 'duckdb'", specifier = ">=1.1,<2" },
+    { name = "jsonschema", specifier = ">=4.23,<5" },
+    { name = "lightgbm", marker = "extra == 'lightgbm'", specifier = ">=4.0,<5" },
+    { name = "numpy", marker = "extra == 'numpy'", specifier = ">=1.26,<3" },
+    { name = "pyarrow", marker = "extra == 'arrow'", specifier = ">=18,<24" },
+    { name = "pyarrow", marker = "extra == 'parquet'", specifier = ">=18,<24" },
+    { name = "pydantic", specifier = ">=2.10,<3" },
+    { name = "pyyaml", marker = "extra == 'yaml'", specifier = ">=6,<7" },
+    { name = "rfc8785", specifier = ">=0.1.4,<1" },
+    { name = "scikit-learn", marker = "extra == 'sklearn'", specifier = ">=1.6,<2" },
+    { name = "skops", marker = "extra == 'sklearn'", specifier = ">=0.12,<1" },
+    { name = "tomli-w", marker = "extra == 'toml'", specifier = ">=1,<2" },
+    { name = "xgboost", marker = "extra == 'xgboost'", specifier = ">=2.1,<4" },
+]
+provides-extras = ["duckdb", "catboost", "xgboost", "sklearn", "parquet", "arrow", "numpy", "yaml", "toml", "xml", "lightgbm"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "duckdb", specifier = ">=1.1,<2" },
+    { name = "pytest", specifier = ">=8.3,<9" },
+    { name = "ruff", specifier = ">=0.9" },
+]
+docs = [{ name = "zensical", specifier = ">=0.0.51" }]
 
 [[package]]
 name = "oclp-explorer"
@@ -348,7 +376,7 @@ docs = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.140.7" },
-    { name = "oclp", extras = ["duckdb"], git = "https://github.com/EvanZ/oclp-python.git?rev=ff2b4a6" },
+    { name = "oclp", extras = ["duckdb"], directory = "../oclp-python" },
     { name = "uvicorn", specifier = ">=0.51.0" },
 ]
 

@@ -3,7 +3,8 @@ export type GraphNode = {
   kind: string;
   record_id: string;
   label: string;
-  digest: string;
+  /** Canonical JSON hash supplied for catalog integrity/debugging only. */
+  record_digest?: string;
   layer?: "data" | "provenance" | "timeline";
   collection_kind?: "dataset-snapshot";
   /** Core Artifact media type, supplied separately for semantic icon choice. */
@@ -37,8 +38,8 @@ export type GraphEdge = {
 export type LifecycleGroup = {
   id: string;
   root_id: string;
-  /** Presentation-only boundary title; lifecycle is the historical default. */
-  title?: "Lifecycle" | "Lineage" | "Inference service";
+  /** Presentation-only boundary title; it never creates a Core relation. */
+  title?: "Run" | "Lineage" | "Inference service";
   label: string;
   member_ids: string[];
 };
@@ -90,7 +91,7 @@ export type Run = {
   record_id: string;
   label: string;
   timeline: {
-    kind: "lifecycle" | "generic" | "none";
+    kind: "run" | "generic" | "none";
     started_at: string | null;
     completed_at: string | null;
     first_event_at: string | null;
@@ -108,12 +109,11 @@ export type InferenceServiceRequest = RunExecution & {
 };
 
 export type InferenceService = {
-  /** Presentation ID; this is intentionally not an OCLP record digest. */
+  /** Presentation ID; this is intentionally not an OCLP record ID. */
   id: string;
-  release_digest: string;
-  release_id: string;
+  release_record_id: string;
   label: string;
-  model_digest?: string;
+  model_record_id?: string;
   source_node_id?: string | null;
   request_count: number;
   status_counts: Record<string, number>;
@@ -126,7 +126,7 @@ export type InferenceService = {
 export type RunLineage = {
   id: string;
   label: string;
-  root_count: number;
+  run_count: number;
   execution_count: number;
   artifact_count: number;
   status_counts: Record<string, number>;
@@ -150,6 +150,7 @@ export type Summary = {
 };
 
 export type RecordPayload = {
-  digest: string;
+  id: string;
+  record_digest: string;
   record: Record<string, unknown>;
 };

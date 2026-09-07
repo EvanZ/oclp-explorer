@@ -606,8 +606,35 @@ class OclpProjectGraph:
         return {
             "id": record_id,
             "record_digest": f"sha256:{self.record_digests[record_id]}",
+            "local_payload_available": self.local_artifact_payload_path(record_id)
+            is not None,
             "record": record.model_dump(mode="json", exclude_none=True),
         }
+
+    def record_path(self, record_id: str) -> Path:
+        """Return the canonical on-disk JSON file for one loaded record."""
+
+        record = self.records[record_id]
+        digest = self.record_digests[record_id]
+        path = self.root / record.kind / digest[:2] / f"{digest}.json"
+        if not path.is_file():
+            raise FileNotFoundError(f"Canonical record file is unavailable: {record_id}")
+        return path.resolve()
+
+    def local_artifact_payload_path(self, record_id: str) -> Path | None:
+        """Return a present local payload file, without resolving remote locations."""
+
+        record = self.records[record_id]
+        if record.kind != "artifact":
+            return None
+        for location in record.locations:
+            parsed = urlparse(location)
+            if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+                continue
+            path = Path(unquote(parsed.path))
+            if path.is_file():
+                return path.resolve()
+        return None
 
     def focused_payload(
         self,
@@ -2098,6 +2125,9 @@ def _reference_edges(records: dict[str, Any]) -> Iterable[dict[str, str]]:
         elif record.kind == "computation":
             if record.implementation.artifact is not None:
                 emit(digest, record.implementation.artifact, "implementation")
+            source_overlay = getattr(record.implementation.source, "overlay", None)
+            if source_overlay is not None:
+                emit(digest, source_overlay, "source-overlay")
         elif record.kind == "execution":
             emit(digest, record.computation, "computation")
             if record.parent_execution is not None:

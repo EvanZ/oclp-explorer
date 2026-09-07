@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import platform
+import subprocess
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock
@@ -14,10 +17,32 @@ from oclp_explorer.graph import OclpProjectGraph, load_project_graph
 from oclp_explorer.run_index import CyclopsRunIndex
 
 
+def _open_folder(folder: Path) -> None:
+    """Ask the local desktop to reveal one already-resolved directory."""
+
+    commands = {
+        "Darwin": ("open", str(folder)),
+        "Linux": ("xdg-open", str(folder)),
+        "Windows": ("explorer", str(folder)),
+    }
+    command = commands.get(platform.system())
+    if command is None:
+        raise RuntimeError("Opening folders is not supported on this platform.")
+    try:
+        subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        raise RuntimeError("CYCLOPS could not open the local folder.") from error
+
+
 def create_app(
     oclp_dir: Path | str = Path("data/oclp"),
     *,
     run_index_path: Path | str | None = None,
+    reveal_folder: Callable[[Path], None] = _open_folder,
 ) -> FastAPI:
     """Create a CYCLOPS API bound to one explicit local OCLP store."""
 
@@ -90,7 +115,7 @@ def create_app(
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5175", "http://127.0.0.1:5175"],
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST"],
         allow_headers=["*"],
     )
 
@@ -141,6 +166,35 @@ def create_app(
             raise HTTPException(
                 status_code=404, detail=f"Unknown record ID: {record_id}"
             ) from error
+
+    @app.post("/api/records/{record_id}/reveal")
+    def reveal_record_folder(
+        record_id: str,
+        target: str = Query(default="record", pattern="^(record|payload)$"),
+    ) -> dict[str, str]:
+        """Reveal a selected record's canonical JSON or local payload folder."""
+
+        try:
+            project_graph = graph()
+            if target == "record":
+                folder = project_graph.record_path(record_id).parent
+            else:
+                payload_path = project_graph.local_artifact_payload_path(record_id)
+                if payload_path is None:
+                    raise FileNotFoundError(
+                        "This record has no available local Artifact payload."
+                    )
+                folder = payload_path.parent
+            reveal_folder(folder)
+            return {"target": target, "folder": str(folder)}
+        except KeyError as error:
+            raise HTTPException(
+                status_code=404, detail=f"Unknown record ID: {record_id}"
+            ) from error
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=501, detail=str(error)) from error
 
     @app.get("/api/lineage/{record_id}")
     def lineage(

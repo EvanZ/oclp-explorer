@@ -97,6 +97,28 @@ def _fixture_store(
                 members=(ArtifactSetMember(name="model", artifact=model),),
             )
         )
+        source_patch = publisher.artifact_for_bytes(
+            artifact_id=_id("urn:example:artifact:source-overlay-patch"),
+            name="Working source patch",
+            relative_path="source-overlay.patch",
+            content=b"diff --git a/example.py b/example.py\n",
+            media_type="text/x-diff",
+            created_at=now,
+        ).reference
+        source_overlay = publisher.publish(
+            ArtifactSet(
+                id=_id("urn:example:artifact-set:source-overlay"),
+                name="Working source overlay",
+                created_at=now,
+                members=(
+                    ArtifactSetMember(
+                        name="tracked.patch",
+                        artifact=source_patch,
+                        role="tracked-source-changes",
+                    ),
+                ),
+            )
+        )
         release_manifest = publisher.json_artifact(
             artifact_id=_id("urn:example:artifact:model-release-manifest"),
             name="Candidate release manifest",
@@ -110,7 +132,12 @@ def _fixture_store(
                 }
             },
         ).reference
-        source_basis = GitSource(repository="https://example.test/project.git", commit="a" * 40)
+        source_basis = GitSource(
+            repository="https://example.test/project.git",
+            commit="a" * 40,
+            dirty=True,
+            overlay=source_overlay,
+        )
         prepare = publisher.publish(computation_record(_prepare, source=source_basis))
         train = publisher.publish(computation_record(_train, source=source_basis))
         root_execution = publisher.publish(
@@ -174,6 +201,7 @@ def _fixture_store(
         "features": features,
         "model": model,
         "release": release,
+        "source_overlay": source_overlay,
         "release_manifest": release_manifest,
         "root_execution": root_execution,
         "child_execution": child_execution,
@@ -668,6 +696,14 @@ def test_provenance_and_timeline_bind_events_to_their_execution(tmp_path: Path) 
     assert any(edge["relation"] == "evidence-subject" for edge in provenance["edges"])
     assert any(node["kind"] == "evidence" for node in provenance["nodes"])
     assert any(node["kind"] == "computation" for node in provenance["nodes"])
+    assert refs["source_overlay"].id in {
+        node["id"] for node in provenance["nodes"]
+    }
+    assert any(
+        edge["relation"] == "source-overlay"
+        and edge["target"] == refs["source_overlay"].id
+        for edge in provenance["edges"]
+    )
     timeline = graph.graph_payload(
         view="timeline",
         run=graph.runs_payload()["runs"][0]["id"],
@@ -722,3 +758,37 @@ def test_run_index_and_api_use_execution_names(tmp_path: Path) -> None:
         )
         assert response.status_code == 200
         assert any(node["kind"] == "execution" for node in response.json()["nodes"])
+
+
+def test_api_reveals_canonical_record_and_local_artifact_payload_folders(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "oclp"
+    refs = _fixture_store(root)
+    graph = load_project_graph(root)
+    revealed: list[Path] = []
+
+    with TestClient(create_app(root, reveal_folder=revealed.append)) as client:
+        detail = client.get(f"/api/records/{refs['model'].id}")
+        assert detail.status_code == 200
+        assert detail.json()["local_payload_available"] is True
+
+        record_folder = client.post(
+            f"/api/records/{refs['model'].id}/reveal",
+            params={"target": "record"},
+        )
+        assert record_folder.status_code == 200
+        assert revealed[-1] == graph.record_path(refs["model"].id).parent
+
+        payload_folder = client.post(
+            f"/api/records/{refs['model'].id}/reveal",
+            params={"target": "payload"},
+        )
+        assert payload_folder.status_code == 200
+        assert revealed[-1] == graph.local_artifact_payload_path(refs["model"].id).parent
+
+        unavailable = client.post(
+            f"/api/records/{refs['release'].id}/reveal",
+            params={"target": "payload"},
+        )
+        assert unavailable.status_code == 404

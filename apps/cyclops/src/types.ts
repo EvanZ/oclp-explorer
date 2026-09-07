@@ -152,5 +152,7 @@ export type Summary = {
 export type RecordPayload = {
   id: string;
   record_digest: string;
+  /** Whether this Artifact has a present local ``file:`` payload location. */
+  local_payload_available: boolean;
   record: Record<string, unknown>;
 };

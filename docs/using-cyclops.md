@@ -84,6 +84,20 @@ the context for every Execution in that run; with one Execution selected it
 narrows to that computation. It does not replace the Data DAG; it adds the
 references required to understand why the work was observed as it was.
 
+When a Computation declares a dirty `GitSource.overlay`, Provenance also shows
+the bound source-overlay ArtifactSet and its dashed source-provenance edges.
+That set is not a data input or output, so it remains absent from Data DAG.
+Double-click it to inspect the captured patch or selected untracked source-file
+members.
+
+## Local record and payload folders
+
+When a record is selected, the detail drawer can open the folder containing
+its canonical OCLP JSON record. For an Artifact with a present local `file:`
+location, it also offers **Open payload folder**. CYCLOPS never opens remote
+payload locations; the action is available only for a local file that exists
+at inspection time.
+
 ## Collections and selection
 
 ArtifactSets and dataset-snapshot Artifacts are collections. Their members are
@@ -130,9 +144,10 @@ not new fields on an Execution.
 - **Lightning**: an Event.
 - **Shield**: Evidence.
 
-Data-DAG edges animate to emphasize artifact flow. Provenance edges stay still
-because they are context rather than material flow. The toolbar can export the
-current complete graph as an animated GIF.
+Data-DAG edges animate to emphasize artifact flow, and execution, event, and
+ArtifactSet icons use their corresponding live motion. Provenance edges stay
+still because they are context rather than material flow. The toolbar can
+export the current complete graph as an animated GIF with those motions.
 
 ## Roadmap
 

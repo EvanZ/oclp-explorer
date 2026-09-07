@@ -42,6 +42,7 @@ import {
   FileSpreadsheet,
   FileStack,
   FileText,
+  FolderOpen,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
@@ -71,6 +72,7 @@ import type {
 
 type ThemeName = "dark" | "light";
 type RunStatusFilter = "all" | "needs_attention" | "failed" | "succeeded";
+type RevealTarget = "record" | "payload";
 type FilteredRun = {
   run: Run;
   executions: RunExecution[];
@@ -152,9 +154,12 @@ const RUN_STATUS_FILTERS: Array<{ id: RunStatusFilter; label: string }> = [
   { id: "failed", label: "Failed" },
   { id: "succeeded", label: "Succeeded" },
 ];
-const GIF_FRAME_COUNT = 15;
-const GIF_FRAME_DELAY_MS = 180;
-const GIF_MAX_WIDTH = 1280;
+const GIF_FRAME_COUNT = 24;
+const GIF_FRAME_DELAY_MS = 120;
+// GIFs are commonly enlarged in issues and docs. Render at retina density
+// rather than the on-screen panel size, while keeping a practical file-size cap.
+const GIF_EXPORT_PIXEL_RATIO = 2;
+const GIF_MAX_WIDTH = 1920;
 const TIMELINE_AXIS_LEFT = 120;
 const TIMELINE_UNTIMED_INPUT_OFFSET = 260;
 const TIMELINE_MIN_WIDTH = 920;
@@ -251,6 +256,9 @@ const ARTIFACT_MEDIA_TYPE_ICONS: Record<string, LucideIcon> = {
   "application/xml": FileCode2,
   "application/x-npy": Binary,
   "application/x-npz": Binary,
+  "text/x-diff": FileCode2,
+  "text/x-patch": FileCode2,
+  "application/x-patch": FileCode2,
   "application/x-catboost-model": BrainCircuit,
   "application/x-xgboost-ubjson": ChartNoAxesCombined,
   "application/x-lightgbm-model": ChartNoAxesCombined,
@@ -483,6 +491,62 @@ function recordNodeHeight(
   return Math.max(minimumHeight, Math.ceil((labelLines + timestampLines) * 16.2 + verticalPadding + 4));
 }
 
+// Expanded collections are real React Flow parent nodes. Their members keep
+// their normal, label-derived record height, so the container must be sized
+// from those same dimensions rather than an assumed 70px row. A source patch,
+// for example, often needs several text lines.
+const COLLECTION_MEMBER_LEFT = 20;
+const COLLECTION_MEMBER_GAP = 12;
+const COLLECTION_BOTTOM_PADDING = 16;
+
+function collectionHeaderHeight(collection: GraphNode): number {
+  return recordNodeHeight(
+    collection.kind,
+    collection.label,
+    collection.collection_kind,
+  );
+}
+
+function collectionContainerHeight(
+  collection: GraphNode,
+  members: GraphNode[],
+): number {
+  if (!members.length) return collectionHeaderHeight(collection);
+  return (
+    collectionHeaderHeight(collection) +
+    COLLECTION_MEMBER_GAP +
+    members.reduce(
+      (height, member) =>
+        height + recordNodeHeight(member.kind, member.label, member.collection_kind),
+      0,
+    ) +
+    (members.length - 1) * COLLECTION_MEMBER_GAP +
+    COLLECTION_BOTTOM_PADDING
+  );
+}
+
+function collectionMemberY(
+  collection: GraphNode,
+  members: GraphNode[],
+  index: number,
+): number {
+  return (
+    collectionHeaderHeight(collection) +
+    COLLECTION_MEMBER_GAP +
+    members.slice(0, index).reduce(
+      (offset, member) =>
+        offset +
+        recordNodeHeight(member.kind, member.label, member.collection_kind) +
+        COLLECTION_MEMBER_GAP,
+      0,
+    )
+  );
+}
+
+function collectionLayoutSlots(collection: GraphNode, members: GraphNode[]): number {
+  return Math.max(1, Math.ceil(collectionContainerHeight(collection, members) / 140));
+}
+
 function timelineNodeWidth(node: GraphNode): number {
   return recordNodeWidth(node.kind, node.collection_kind);
 }
@@ -580,8 +644,11 @@ function timelineTickLabel(value: number, step: number): string {
 
 type GifFlowPulse = {
   color: string;
+  dashOffset: number;
+  dashPattern: [number, number];
   lineWidth: number;
   path: Path2D;
+  transform: DOMMatrix;
 };
 type GifNodeRect = {
   height: number;
@@ -595,26 +662,42 @@ function gifFlowPulses(graphPanel: HTMLDivElement, scale: number): GifFlowPulse[
   return [...graphPanel.querySelectorAll<SVGPathElement>(
     ".react-flow__edge.animated .react-flow__edge-path",
   )].flatMap((edge) => {
-    const matrix = edge.getScreenCTM();
-    const length = edge.getTotalLength();
-    if (!matrix || length <= 0) return [];
+    const data = edge.getAttribute("d");
+    const viewport = edge.closest<HTMLElement>(".react-flow__viewport");
+    const pane = viewport?.parentElement;
+    if (!data || !viewport || !pane) return [];
 
-    const path = new Path2D();
-    const step = 8;
-    for (let distance = 0; distance <= length; distance += step) {
-      const point = edge.getPointAtLength(Math.min(distance, length));
-      const screenPoint = new DOMPoint(point.x, point.y).matrixTransform(matrix);
-      const x = (screenPoint.x - bounds.left) * scale;
-      const y = (screenPoint.y - bounds.top) * scale;
-      if (distance === 0) path.moveTo(x, y);
-      else path.lineTo(x, y);
-    }
+    // React Flow stores edge paths in its untransformed canvas coordinate
+    // system and applies pan/zoom to the viewport parent. SVG path geometry
+    // APIs are not consistently exposed on those paths during export, so map
+    // the path data through that known viewport transform ourselves.
+    const viewportStyle = window.getComputedStyle(viewport);
+    const matrix = viewportStyle.transform === "none"
+      ? new DOMMatrix()
+      : new DOMMatrix(viewportStyle.transform);
+    const paneBounds = pane.getBoundingClientRect();
+    const screenScale = Math.max(
+      0.001,
+      (Math.hypot(matrix.a, matrix.b) + Math.hypot(matrix.c, matrix.d)) / 2,
+    );
+    const transform = new DOMMatrix([
+      matrix.a * scale,
+      matrix.b * scale,
+      matrix.c * scale,
+      matrix.d * scale,
+      (paneBounds.left + matrix.e - bounds.left) * scale,
+      (paneBounds.top + matrix.f - bounds.top) * scale,
+    ]);
 
     const style = window.getComputedStyle(edge);
+    const lineWidth = Number.parseFloat(style.strokeWidth) || 1;
     return [{
       color: style.stroke,
-      lineWidth: Number.parseFloat(style.strokeWidth) || 1,
-      path,
+      dashOffset: 9 / screenScale,
+      dashPattern: [11 / screenScale, 13 / screenScale],
+      lineWidth: (lineWidth + 0.6) / screenScale,
+      path: new Path2D(data),
+      transform,
     }];
   });
 }
@@ -629,13 +712,16 @@ function drawGifFlowPulses(
   context.lineCap = "round";
   context.lineJoin = "round";
   for (const pulse of pulses) {
-    context.setLineDash([11 * scale, 13 * scale]);
-    context.lineDashOffset = -frame * 9 * scale;
-    context.lineWidth = Math.max(1.6, pulse.lineWidth * scale + 0.6);
+    context.save();
+    context.setTransform(pulse.transform);
+    context.setLineDash(pulse.dashPattern);
+    context.lineDashOffset = -frame * pulse.dashOffset;
+    context.lineWidth = pulse.lineWidth;
     context.strokeStyle = pulse.color;
     context.shadowBlur = 3 * scale;
     context.shadowColor = pulse.color;
     context.stroke(pulse.path);
+    context.restore();
   }
   context.restore();
 }
@@ -649,7 +735,10 @@ function gifNodeRects(
   const panelBounds = graphPanel.getBoundingClientRect();
   const inset = Math.ceil(4 * scale);
   return [...graphPanel.querySelectorAll<HTMLElement>(
-    ".react-flow__node:not(.react-flow__node-timelineTick)",
+    // Lifecycle group nodes are background boundaries, not foreground cards.
+    // Restoring one after drawing a pulse restores its entire large rectangle
+    // and therefore erases all of the graph's animated edges.
+    ".react-flow__node:not(.react-flow__node-timelineTick):not(.react-flow__node-lifecycleGroup)",
   )]
     .map((node) => {
       const bounds = node.getBoundingClientRect();
@@ -673,11 +762,11 @@ function gifNodeRects(
 
 function restoreGifNodeLayers(
   context: CanvasRenderingContext2D,
-  baseImage: ImageData,
+  frameImage: ImageData,
   nodeRects: GifNodeRect[],
 ): void {
   for (const rect of nodeRects) {
-    context.putImageData(baseImage, 0, 0, rect.x, rect.y, rect.width, rect.height);
+    context.putImageData(frameImage, 0, 0, rect.x, rect.y, rect.width, rect.height);
   }
 }
 
@@ -1090,22 +1179,57 @@ function mergeProvenanceOverlay(
     return node ? [node] : [];
   });
   const nodes = [...graph.nodes, ...provenanceNodes];
-  const nodeIds = new Set([
-    ...nodes.map((node) => node.id),
-    ...graph.collection_nodes.map((node) => node.id),
-  ]);
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const allCollectionNodes = new Map(
+    [...graph.collection_nodes, ...provenance.collection_nodes].map((node) => [
+      node.id,
+      node,
+    ]),
+  );
   const uniqueEdges = (edges: GraphEdge[]) =>
     [...new Map(edges.map((edge) => [edge.id, edge])).values()].filter(
       (edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target),
     );
   const edges = uniqueEdges([...graph.edges, ...provenanceEdges]);
-  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  // An ArtifactSet that arrives through provenance is still a real collection.
+  // Its member Artifact is intentionally supplied as a contextual
+  // ``collection_node`` so the client can keep the set collapsed by default.
+  // Preserve that membership projection when the set itself is attached;
+  // otherwise a source overlay is rendered as an unexpandable ArtifactSet.
+  const collectionEdges = [
+    ...new Map(
+      [...graph.collection_edges, ...provenance.collection_edges].map((edge) => [
+        edge.id,
+        edge,
+      ]),
+    ).values(),
+  ].filter(
+    (edge) =>
+      nodeIds.has(edge.source) &&
+      (nodeIds.has(edge.target) || allCollectionNodes.has(edge.target)),
+  );
+  const collectionNodes = [...allCollectionNodes.values()].filter((node) =>
+    collectionEdges.some(
+      (edge) => edge.target === node.id && !nodeIds.has(node.id),
+    ),
+  );
+  // Provenance may introduce an Artifact or ArtifactSet that explains a
+  // materialization without being part of its Data DAG (for example, the
+  // captured overlay for a dirty GitSource).  Once that context is attached
+  // to a selected run, its presentation boundary must own it too.  Include
+  // collection members as well so expanding an attached ArtifactSet cannot
+  // make its members appear outside the same boundary.
+  const nodeById = new Map(
+    [...nodes, ...collectionNodes].map((node) => [node.id, node]),
+  );
+  const collectionNodeIds = new Set(collectionNodes.map((node) => node.id));
+  const boundaryEdges = [...edges, ...collectionEdges];
   const lifecycleGroups = graph.lifecycle_groups.map((group) => {
     const memberIds = new Set(group.member_ids);
     let changed = true;
     while (changed) {
       changed = false;
-      for (const edge of edges) {
+      for (const edge of boundaryEdges) {
         const source = nodeById.get(edge.source);
         const target = nodeById.get(edge.target);
         const sourceIsMember = memberIds.has(edge.source);
@@ -1114,8 +1238,11 @@ function mergeProvenanceOverlay(
         if (
           !contextualNode ||
           memberIds.has(contextualNode.id) ||
-          contextualNode.layer !== "provenance" ||
-          !["event", "evidence", "computation"].includes(contextualNode.kind)
+          // Every node admitted through the attached Provenance overlay is
+          // run context.  Restricting this to a few record kinds orphaned
+          // provenance ArtifactSets such as dirty-source overlays.
+          (contextualNode.layer !== "provenance" &&
+            !collectionNodeIds.has(contextualNode.id))
         ) {
           continue;
         }
@@ -1129,10 +1256,12 @@ function mergeProvenanceOverlay(
     ...graph,
     nodes,
     edges,
+    collection_nodes: collectionNodes,
     lifecycle_groups: lifecycleGroups,
     // Collection membership is contextual data navigation, not provenance.
-    // Keep the primary view's collection projection unchanged as well.
-    collection_edges: graph.collection_edges,
+    // Keep the primary projection and add only membership that belongs to
+    // Provenance records actually attached to this graph.
+    collection_edges: collectionEdges,
   };
 }
 
@@ -1320,10 +1449,7 @@ function flowNodes(
     const column = dataColumnFor(node);
     const row = nextDataRowByColumn.get(column) ?? 0;
     const slots = artifactSets.memberNodesBySet.has(node.id)
-      ? Math.max(
-          1,
-          Math.ceil((58 + (artifactSets.memberNodesBySet.get(node.id)?.length ?? 0) * 70) / 140),
-        )
+      ? collectionLayoutSlots(node, artifactSets.memberNodesBySet.get(node.id) ?? [])
       : 1;
     dataRowByNode.set(node.id, row);
     nextDataRowByColumn.set(column, row + slots);
@@ -1487,7 +1613,7 @@ function flowNodes(
               : 10,
         width: isTimeline ? timelineNodeWidth(node) : recordNodeWidth(node.kind, node.collection_kind),
         height: isCollection
-          ? 58 + (artifactSets.memberNodesBySet.get(node.id)?.length ?? 0) * 70
+          ? collectionContainerHeight(node, artifactSets.memberNodesBySet.get(node.id) ?? [])
           : isTimeline
             ? timelineNodeHeight(node)
             : recordNodeHeight(node.kind, node.label, node.collection_kind),
@@ -1661,7 +1787,7 @@ function flowNodes(
   for (const node of rootNodes) {
     const members = artifactSets.memberNodesBySet.get(node.id) ?? [];
     const slots = members.length
-      ? Math.max(1, Math.ceil((58 + members.length * 70) / 140))
+      ? collectionLayoutSlots(node, members)
       : 1;
     rootPositionById.set(
       node.id,
@@ -1685,7 +1811,7 @@ function flowNodes(
       return {
         width: recordNodeWidth(node.kind, node.collection_kind),
         height: members.length
-          ? 58 + members.length * 70
+          ? collectionContainerHeight(node, members)
           : recordNodeHeight(node.kind, node.label, node.collection_kind),
       };
     };
@@ -1743,7 +1869,14 @@ function flowNodes(
       rendered.push(renderNode(node, position, { collection: true }));
       members.forEach((member, index) => {
         rendered.push(
-          renderNode(member, { x: 20, y: 48 + index * 70 }, { parentId: node.id }),
+          renderNode(
+            member,
+            {
+              x: COLLECTION_MEMBER_LEFT,
+              y: collectionMemberY(node, members, index),
+            },
+            { parentId: node.id },
+          ),
         );
       });
       return;
@@ -1764,6 +1897,7 @@ const REVERSED_REFERENCE_FLOW_RELATIONS = new Set([
   "implementation",
   "input",
   "release-manifest",
+  "source-overlay",
 ]);
 
 function asCausalFlowEdge(edge: GraphEdge): GraphEdge {
@@ -1989,6 +2123,8 @@ export default function App() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [isSelectedLoading, setIsSelectedLoading] = useState(false);
   const [selectedRecordError, setSelectedRecordError] = useState<string | null>(null);
+  const [revealingFolder, setRevealingFolder] = useState<RevealTarget | null>(null);
+  const [revealError, setRevealError] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2260,7 +2396,9 @@ export default function App() {
   const visibleNodes = useMemo(() => {
     if (
       !displayGraph ||
-      (displayGraph.view !== "run" && displayGraph.view !== "derivation")
+      (displayGraph.view !== "run" &&
+        displayGraph.view !== "derivation" &&
+        displayGraph.view !== "provenance")
     ) {
       return displayGraph?.nodes ?? [];
     }
@@ -2283,7 +2421,11 @@ export default function App() {
   }, [displayGraph, expandedCollections]);
   const visibleEdges = useMemo(() => {
     if (!displayGraph) return [];
-    if (displayGraph.view !== "run" && displayGraph.view !== "derivation") {
+    if (
+      displayGraph.view !== "run" &&
+      displayGraph.view !== "derivation" &&
+      displayGraph.view !== "provenance"
+    ) {
       return displayGraph.edges.map(asCausalFlowEdge);
     }
     const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
@@ -2509,6 +2651,8 @@ export default function App() {
     setSelected(null);
     setIsSelectedLoading(false);
     setSelectedRecordError(null);
+    setRevealingFolder(null);
+    setRevealError(null);
     setCopied(false);
   }, []);
 
@@ -2545,6 +2689,8 @@ export default function App() {
     setSelected(null);
     setIsSelectedLoading(true);
     setSelectedRecordError(null);
+    setRevealingFolder(null);
+    setRevealError(null);
     setCopied(false);
     try {
       const response = await fetch("/api/records/" + node.id, {
@@ -2638,6 +2784,27 @@ export default function App() {
     }
   }, [selected]);
 
+  const revealSelectedFolder = useCallback(async (target: RevealTarget) => {
+    if (!selected) return;
+    setRevealingFolder(target);
+    setRevealError(null);
+    try {
+      const response = await fetch(
+        "/api/records/" + encodeURIComponent(selected.id) + "/reveal?target=" + target,
+        { method: "POST" },
+      );
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null) as { detail?: unknown } | null;
+        const detail = typeof payload?.detail === "string" ? payload.detail : null;
+        throw new Error(detail ?? "CYCLOPS could not open the local folder.");
+      }
+    } catch (revealFailure) {
+      setRevealError((revealFailure as Error).message);
+    } finally {
+      setRevealingFolder(null);
+    }
+  }, [selected]);
+
   const exportFlowGif = useCallback(async () => {
     const graphPanel = graphPanelRef.current;
     if (!graphPanel || !graph) return;
@@ -2647,41 +2814,40 @@ export default function App() {
     setIsExportingGif(true);
     try {
       // Let the export class hide the on-screen controls before cloning the
-      // graph panel for the still background frame.
+      // graph panel for the animated frames.
       await waitForAnimationFrame(0);
-      // Fit the selected graph scope for the export only. The user’s working
-      // viewport is restored immediately after the background is captured.
+      // Fit the selected graph scope for the export only. Keep that viewport
+      // through all frames so every capture has identical graph geometry.
       await flow.current?.fitView({ duration: 0, padding: 0.12 });
       await waitForAnimationFrame(0);
       const bounds = graphPanel.getBoundingClientRect();
       if (bounds.width <= 0 || bounds.height <= 0) {
         throw new Error("CYCLOPS could not determine the visible graph size.");
       }
-      const scale = Math.min(1, GIF_MAX_WIDTH / bounds.width);
+      const scale = Math.min(GIF_EXPORT_PIXEL_RATIO, GIF_MAX_WIDTH / bounds.width);
       const canvasWidth = Math.max(1, Math.round(bounds.width * scale));
       const canvasHeight = Math.max(1, Math.round(bounds.height * scale));
       const gif = GIFEncoder();
-      const canvas = await toCanvas(graphPanel, {
-        backgroundColor: theme.canvasBackground,
-        canvasHeight,
-        canvasWidth,
-        pixelRatio: 1,
-        skipFonts: true,
-      });
-      const context = canvas.getContext("2d", { willReadFrequently: true });
-      if (!context) throw new Error("CYCLOPS could not read the graph capture.");
-      const baseImage = context.getImageData(0, 0, canvas.width, canvas.height);
       const pulses = gifFlowPulses(graphPanel, scale);
-      const nodeRects = gifNodeRects(graphPanel, scale, canvas.width, canvas.height);
-      if (originalViewport) {
-        await flow.current?.setViewport(originalViewport, { duration: 0 });
-        viewportRestored = true;
-      }
+      const nodeRects = gifNodeRects(graphPanel, scale, canvasWidth, canvasHeight);
 
       for (let frame = 0; frame < GIF_FRAME_COUNT; frame += 1) {
-        context.putImageData(baseImage, 0, 0);
+        // CSS animation lives in the browser, not in gifenc. Capture each
+        // rendered frame so node icons advance alongside the flow animation.
+        const canvas = await toCanvas(graphPanel, {
+          backgroundColor: theme.canvasBackground,
+          canvasHeight,
+          canvasWidth,
+          pixelRatio: 1,
+          skipFonts: true,
+        });
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        if (!context) throw new Error("CYCLOPS could not read the graph capture.");
+        const frameImage = context.getImageData(0, 0, canvas.width, canvas.height);
         drawGifFlowPulses(context, pulses, frame, scale);
-        restoreGifNodeLayers(context, baseImage, nodeRects);
+        // Keep current node pixels above the manually rendered flow pulse;
+        // this preserves the live rotating, pulsing, and compressing icons.
+        restoreGifNodeLayers(context, frameImage, nodeRects);
         const image = context.getImageData(0, 0, canvas.width, canvas.height);
         const palette = quantize(image.data, 256);
         gif.writeFrame(applyPalette(image.data, palette), canvas.width, canvas.height, {
@@ -2690,6 +2856,11 @@ export default function App() {
           repeat: 0,
         });
         if (frame < GIF_FRAME_COUNT - 1) await waitForAnimationFrame(GIF_FRAME_DELAY_MS);
+      }
+
+      if (originalViewport) {
+        await flow.current?.setViewport(originalViewport, { duration: 0 });
+        viewportRestored = true;
       }
 
       gif.finish();
@@ -2973,7 +3144,7 @@ export default function App() {
               className={"export-gif" + (isExportingGif ? " is-busy" : "")}
               disabled={!graph || isExportingGif}
               onClick={() => void exportFlowGif()}
-              title="Export the complete current graph with animated data-flow edges"
+              title="Export the complete current graph with animated flow and node icons"
             >
               {isExportingGif ? "Exporting…" : "Export GIF"}
             </button>
@@ -3373,6 +3544,29 @@ export default function App() {
                 </button>
               ) : null}
               <button onClick={showLineage}>Show 3-hop data lineage</button>
+              <div className="record-folder-actions">
+                <button
+                  aria-label="Open canonical record folder"
+                  disabled={revealingFolder !== null}
+                  onClick={() => void revealSelectedFolder("record")}
+                  title="Open the folder containing this canonical OCLP record JSON"
+                >
+                  <FolderOpen aria-hidden="true" size={15} />
+                  {revealingFolder === "record" ? "Opening…" : "Open record folder"}
+                </button>
+                {selected.local_payload_available ? (
+                  <button
+                    aria-label="Open artifact payload folder"
+                    disabled={revealingFolder !== null}
+                    onClick={() => void revealSelectedFolder("payload")}
+                    title="Open the folder containing this Artifact's local payload"
+                  >
+                    <FolderOpen aria-hidden="true" size={15} />
+                    {revealingFolder === "payload" ? "Opening…" : "Open payload folder"}
+                  </button>
+                ) : null}
+              </div>
+              {revealError ? <p className="record-load-error">{revealError}</p> : null}
               <button
                 aria-label="Copy selected record JSON to clipboard"
                 className="copy-json"

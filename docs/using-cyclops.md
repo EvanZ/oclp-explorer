@@ -98,6 +98,16 @@ location, it also offers **Open payload folder**. CYCLOPS never opens remote
 payload locations; the action is available only for a local file that exists
 at inspection time.
 
+For local image Artifacts, Cyclops recognizes PNG, JPEG, WebP, GIF, and SVG
+media types with an image-specific node icon. A selected PNG, JPEG, WebP, or
+GIF is displayed immediately in the detail drawer after Cyclops recomputes
+its SHA-256 and confirms it matches the Artifact record. **Open image** sends
+that same verified local file to the computer's default image application.
+SVG is never embedded because it is an active document format, but a verified
+SVG can still be opened in the default application. Missing, remote,
+unsupported, or digest-mismatched payloads keep the ordinary Artifact
+fallback without preview or open-image actions.
+
 ## Collections and selection
 
 ArtifactSets and dataset-snapshot Artifacts are collections. Their members are

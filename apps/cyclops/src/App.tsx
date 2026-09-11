@@ -43,6 +43,7 @@ import {
   FileStack,
   FileText,
   FolderOpen,
+  Image as ImageIcon,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
@@ -154,6 +155,13 @@ const RUN_STATUS_FILTERS: Array<{ id: RunStatusFilter; label: string }> = [
   { id: "failed", label: "Failed" },
   { id: "succeeded", label: "Succeeded" },
 ];
+const IMAGE_MEDIA_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+  "image/svg+xml",
+]);
 const GIF_FRAME_COUNT = 24;
 const GIF_FRAME_DELAY_MS = 120;
 // GIFs are commonly enlarged in issues and docs. Render at retina density
@@ -259,6 +267,11 @@ const ARTIFACT_MEDIA_TYPE_ICONS: Record<string, LucideIcon> = {
   "text/x-diff": FileCode2,
   "text/x-patch": FileCode2,
   "application/x-patch": FileCode2,
+  "image/png": ImageIcon,
+  "image/jpeg": ImageIcon,
+  "image/webp": ImageIcon,
+  "image/gif": ImageIcon,
+  "image/svg+xml": ImageIcon,
   "application/x-catboost-model": BrainCircuit,
   "application/x-xgboost-ubjson": ChartNoAxesCombined,
   "application/x-lightgbm-model": ChartNoAxesCombined,
@@ -2137,6 +2150,7 @@ export default function App() {
   const [selectedRecordError, setSelectedRecordError] = useState<string | null>(null);
   const [revealingFolder, setRevealingFolder] = useState<RevealTarget | null>(null);
   const [revealError, setRevealError] = useState<string | null>(null);
+  const [isOpeningImage, setIsOpeningImage] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2680,6 +2694,7 @@ export default function App() {
     setSelectedRecordError(null);
     setRevealingFolder(null);
     setRevealError(null);
+    setIsOpeningImage(false);
     setCopied(false);
   }, []);
 
@@ -2718,6 +2733,7 @@ export default function App() {
     setSelectedRecordError(null);
     setRevealingFolder(null);
     setRevealError(null);
+    setIsOpeningImage(false);
     setCopied(false);
     try {
       const response = await fetch("/api/records/" + node.id, {
@@ -2799,6 +2815,9 @@ export default function App() {
   const selectedCollection = selected
     ? isArtifactCollection(graphNodeById.get(selected.id))
     : false;
+  const selectedIsImage = selected
+    ? IMAGE_MEDIA_TYPES.has(String(selected.record.media_type))
+    : false;
 
   const copySelectedRecord = useCallback(async () => {
     if (!selected) return;
@@ -2829,6 +2848,27 @@ export default function App() {
       setRevealError((revealFailure as Error).message);
     } finally {
       setRevealingFolder(null);
+    }
+  }, [selected]);
+
+  const openSelectedImage = useCallback(async () => {
+    if (!selected) return;
+    setIsOpeningImage(true);
+    setRevealError(null);
+    try {
+      const response = await fetch(
+        "/api/records/" + encodeURIComponent(selected.id) + "/image/open",
+        { method: "POST" },
+      );
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null) as { detail?: unknown } | null;
+        const detail = typeof payload?.detail === "string" ? payload.detail : null;
+        throw new Error(detail ?? "CYCLOPS could not open the verified local image.");
+      }
+    } catch (openFailure) {
+      setRevealError((openFailure as Error).message);
+    } finally {
+      setIsOpeningImage(false);
     }
   }, [selected]);
 
@@ -3610,6 +3650,32 @@ export default function App() {
                   </button>
                 ) : null}
               </div>
+              {selected.image_preview_available ? (
+                <section className="image-preview" aria-label="Image preview">
+                  <img
+                    alt={String(selected.record.name ?? "Artifact image")}
+                    src={"/api/records/" + encodeURIComponent(selected.id) + "/image"}
+                  />
+                </section>
+              ) : null}
+              {selected.image_payload_available ? (
+                <button
+                  aria-label="Open verified image in default application"
+                  disabled={isOpeningImage}
+                  onClick={() => void openSelectedImage()}
+                  title="Open this verified local image in the computer's default image application"
+                >
+                  <ExternalLink aria-hidden="true" size={15} />
+                  {isOpeningImage ? "Opening…" : "Open image"}
+                </button>
+              ) : null}
+              {selectedIsImage && !selected.image_preview_available ? (
+                <p className="image-preview-note">
+                  {String(selected.record.media_type) === "image/svg+xml"
+                    ? "SVG payloads are not embedded for safety. Open the verified image in your default application instead."
+                    : "No verified local image payload is available to preview or open."}
+                </p>
+              ) : null}
               {revealError ? <p className="record-load-error">{revealError}</p> : null}
               <button
                 aria-label="Copy selected record JSON to clipboard"

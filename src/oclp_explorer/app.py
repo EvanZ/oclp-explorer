@@ -12,6 +12,7 @@ from threading import Lock
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from oclp_explorer.graph import OclpProjectGraph, load_project_graph
 from oclp_explorer.run_index import CyclopsRunIndex
@@ -38,11 +39,33 @@ def _open_folder(folder: Path) -> None:
         raise RuntimeError("CYCLOPS could not open the local folder.") from error
 
 
+def _open_file(path: Path) -> None:
+    """Ask the local desktop to open one already-verified local file."""
+
+    commands = {
+        "Darwin": ("open", str(path)),
+        "Linux": ("xdg-open", str(path)),
+        "Windows": ("explorer", str(path)),
+    }
+    command = commands.get(platform.system())
+    if command is None:
+        raise RuntimeError("Opening files is not supported on this platform.")
+    try:
+        subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        raise RuntimeError("CYCLOPS could not open the verified local image.") from error
+
+
 def create_app(
     oclp_dir: Path | str = Path("data/oclp"),
     *,
     run_index_path: Path | str | None = None,
     reveal_folder: Callable[[Path], None] = _open_folder,
+    open_file: Callable[[Path], None] = _open_file,
 ) -> FastAPI:
     """Create a CYCLOPS API bound to one explicit local OCLP store."""
 
@@ -166,6 +189,54 @@ def create_app(
             raise HTTPException(
                 status_code=404, detail=f"Unknown record ID: {record_id}"
             ) from error
+
+    @app.get("/api/records/{record_id}/image")
+    def image_payload(record_id: str) -> FileResponse:
+        """Serve one verified local raster Artifact for an in-app preview."""
+
+        try:
+            project_graph = graph()
+            path = project_graph.local_raster_image_payload_path(record_id)
+            if path is None:
+                raise FileNotFoundError(
+                    "This record has no verified local raster image payload."
+                )
+            media_type = project_graph.records[record_id].media_type
+            return FileResponse(
+                path,
+                media_type=media_type,
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+        except KeyError as error:
+            raise HTTPException(
+                status_code=404, detail=f"Unknown record ID: {record_id}"
+            ) from error
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+
+    @app.post("/api/records/{record_id}/image/open")
+    def open_image_payload(record_id: str) -> dict[str, str]:
+        """Open one verified local Artifact image in the system default app."""
+
+        try:
+            path = graph().local_image_payload_path(record_id)
+            if path is None:
+                raise FileNotFoundError(
+                    "This record has no verified local image payload."
+                )
+            open_file(path)
+            return {"path": str(path)}
+        except KeyError as error:
+            raise HTTPException(
+                status_code=404, detail=f"Unknown record ID: {record_id}"
+            ) from error
+        except FileNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=501, detail=str(error)) from error
 
     @app.post("/api/records/{record_id}/reveal")
     def reveal_record_folder(

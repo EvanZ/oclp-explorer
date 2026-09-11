@@ -89,6 +89,26 @@ def _fixture_store(
             value={"model": "linear"},
             created_at=now + timedelta(seconds=20),
         ).reference
+        chart = publisher.artifact_for_bytes(
+            artifact_id=_id("urn:example:artifact:holdout-chart"),
+            name="Holdout demand forecast chart",
+            relative_path="holdout-demand-forecast.png",
+            content=(
+                b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+                b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00"
+                b"\x1f\x15\xc4\x89"
+            ),
+            media_type="image/png",
+            created_at=now + timedelta(seconds=20),
+        ).reference
+        svg_chart = publisher.artifact_for_bytes(
+            artifact_id=_id("urn:example:artifact:unsafe-svg-chart"),
+            name="Unsafe SVG chart",
+            relative_path="unsafe-chart.svg",
+            content=b"<svg xmlns='http://www.w3.org/2000/svg'><script /></svg>",
+            media_type="image/svg+xml",
+            created_at=now + timedelta(seconds=20),
+        ).reference
         release = publisher.publish(
             ArtifactSet(
                 id=_id("urn:example:artifact-set:model-release"),
@@ -198,6 +218,8 @@ def _fixture_store(
         "source": source,
         "features": features,
         "model": model,
+        "chart": chart,
+        "svg_chart": svg_chart,
         "release": release,
         "source_overlay": source_overlay,
         "release_manifest": release_manifest,
@@ -768,14 +790,53 @@ def test_api_reveals_canonical_record_and_local_artifact_payload_folders(
     refs = _fixture_store(root)
     graph = load_project_graph(root)
     revealed: list[Path] = []
+    opened: list[Path] = []
 
-    with TestClient(create_app(root, reveal_folder=revealed.append)) as client:
+    with TestClient(
+        create_app(
+            root,
+            reveal_folder=revealed.append,
+            open_file=opened.append,
+        )
+    ) as client:
         detail = client.get(f"/api/records/{refs['model'].id}")
         assert detail.status_code == 200
         assert detail.json()["local_payload_available"] is True
         assert detail.json()["record"]["description"] == (
             "Linear model selected for the candidate release."
         )
+
+        image_detail = client.get(f"/api/records/{refs['chart'].id}")
+        assert image_detail.status_code == 200
+        assert image_detail.json()["image_preview_available"] is True
+        assert image_detail.json()["image_payload_available"] is True
+        image = client.get(f"/api/records/{refs['chart'].id}/image")
+        assert image.status_code == 200
+        assert image.headers["content-type"] == "image/png"
+        assert image.content.startswith(b"\x89PNG\r\n\x1a\n")
+
+        chart_path = graph.local_artifact_payload_path(refs["chart"].id)
+        assert chart_path is not None
+        open_chart = client.post(f"/api/records/{refs['chart'].id}/image/open")
+        assert open_chart.status_code == 200
+        assert opened[-1] == chart_path
+        chart_path.write_bytes(b"tampered")
+        assert client.get(f"/api/records/{refs['chart'].id}/image").status_code == 404
+        assert client.post(f"/api/records/{refs['chart'].id}/image/open").status_code == 404
+
+        svg_detail = client.get(f"/api/records/{refs['svg_chart'].id}")
+        assert svg_detail.status_code == 200
+        assert svg_detail.json()["image_preview_available"] is False
+        assert svg_detail.json()["image_payload_available"] is True
+        assert client.get(f"/api/records/{refs['svg_chart'].id}/image").status_code == 404
+        svg_path = graph.local_artifact_payload_path(refs["svg_chart"].id)
+        assert svg_path is not None
+        open_svg = client.post(f"/api/records/{refs['svg_chart'].id}/image/open")
+        assert open_svg.status_code == 200
+        assert opened[-1] == svg_path
+
+        not_an_image = client.get(f"/api/records/{refs['model'].id}/image")
+        assert not_an_image.status_code == 404
 
         execution_detail = client.get(f"/api/records/{refs['root_execution'].id}")
         assert execution_detail.status_code == 200

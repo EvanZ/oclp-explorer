@@ -154,6 +154,10 @@ export type RecordPayload = {
   record_digest: string;
   /** Whether this Artifact has a present local ``file:`` payload location. */
   local_payload_available: boolean;
+  /** Whether a locally present raster payload matched its Artifact SHA-256. */
+  image_preview_available: boolean;
+  /** Whether a locally present image payload matched its Artifact SHA-256. */
+  image_payload_available: boolean;
   record: Record<string, unknown>;
   /** CYCLOPS display context resolved through ``Execution.computation``. */
   computation_context?: {

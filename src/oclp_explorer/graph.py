@@ -37,6 +37,27 @@ RECORD_KINDS = (
     "event",
 )
 
+# Image payloads may be opened only after their asserted Artifact digest has
+# been verified. SVG is deliberately excluded from *embedding*: its active
+# document semantics make an untrusted payload unsafe inside the Cyclops page.
+IMAGE_MEDIA_TYPES = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "image/svg+xml",
+    }
+)
+RASTER_IMAGE_MEDIA_TYPES = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+    }
+)
+
 
 @dataclass(frozen=True)
 class _InvocationSummary:
@@ -608,6 +629,10 @@ class OclpProjectGraph:
             "record_digest": f"sha256:{self.record_digests[record_id]}",
             "local_payload_available": self.local_artifact_payload_path(record_id)
             is not None,
+            "image_preview_available": self.local_raster_image_payload_path(record_id)
+            is not None,
+            "image_payload_available": self.local_image_payload_path(record_id)
+            is not None,
             "record": record.model_dump(mode="json", exclude_none=True),
         }
         if record.kind == "execution":
@@ -647,6 +672,32 @@ class OclpProjectGraph:
             if path.is_file():
                 return path.resolve()
         return None
+
+    def local_image_payload_path(self, record_id: str) -> Path | None:
+        """Return a verified local image payload suitable for opening.
+
+        The immutable Artifact record is authoritative about both media type
+        and SHA-256 digest. A payload that no longer matches that digest is
+        still inspectable through its local folder, but it is never opened or
+        served as an image by Cyclops.
+        """
+
+        record = self.records[record_id]
+        if record.kind != "artifact" or record.media_type not in IMAGE_MEDIA_TYPES:
+            return None
+        path = self.local_artifact_payload_path(record_id)
+        if path is None:
+            return None
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        return path if digest == record.digest.value else None
+
+    def local_raster_image_payload_path(self, record_id: str) -> Path | None:
+        """Return a verified local raster image payload suitable for preview."""
+
+        record = self.records[record_id]
+        if record.kind != "artifact" or record.media_type not in RASTER_IMAGE_MEDIA_TYPES:
+            return None
+        return self.local_image_payload_path(record_id)
 
     def focused_payload(
         self,

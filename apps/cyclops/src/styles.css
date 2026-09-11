@@ -130,6 +130,13 @@ h2 { font-size: 18px; overflow-wrap: anywhere; }
 .detail-panel > p:not(.eyebrow) { color: var(--muted); line-height: 1.5; margin-top: 14px; }
 .detail-panel > .record-load-error { color: var(--error-text); }
 .record-id, .store-root { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; overflow-wrap: anywhere; }
+.record-description { border-left: 2px solid var(--accent); margin-top: 16px; padding-left: 10px; }
+.record-description h3 { font-size: 11px; letter-spacing: .08em; margin: 0; text-transform: uppercase; }
+.record-description p { color: var(--text) !important; font-size: 13px; line-height: 1.45; margin: 5px 0 0; }
+.computation-context { border-top: 1px solid var(--border); margin-top: 16px; padding-top: 14px; }
+.computation-context h3 { color: var(--muted); font-size: 11px; letter-spacing: .08em; margin: 0; text-transform: uppercase; }
+.computation-context > p { color: var(--text); font-size: 13px; font-weight: 650; line-height: 1.4; margin: 5px 0 0; }
+.computation-context > .computation-context-description { color: var(--muted); font-weight: 400; }
 .detail-panel button { margin-top: 14px; }
 .detail-panel .copy-json { align-items: center; display: inline-flex; gap: 6px; margin-left: 8px; }
 .detail-panel .copy-json span { font-size: 15px; line-height: 1; }

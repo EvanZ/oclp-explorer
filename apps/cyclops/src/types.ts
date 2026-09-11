@@ -155,4 +155,10 @@ export type RecordPayload = {
   /** Whether this Artifact has a present local ``file:`` payload location. */
   local_payload_available: boolean;
   record: Record<string, unknown>;
+  /** CYCLOPS display context resolved through ``Execution.computation``. */
+  computation_context?: {
+    id: string;
+    name: string | null;
+    description: string | null;
+  };
 };

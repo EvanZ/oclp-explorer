@@ -603,13 +603,25 @@ class OclpProjectGraph:
         """Return one stored record by its Core UUID."""
 
         record = self.records[record_id]
-        return {
+        payload: dict[str, object] = {
             "id": record_id,
             "record_digest": f"sha256:{self.record_digests[record_id]}",
             "local_payload_available": self.local_artifact_payload_path(record_id)
             is not None,
             "record": record.model_dump(mode="json", exclude_none=True),
         }
+        if record.kind == "execution":
+            computation = self.records.get(record.computation.id)
+            if computation is not None and computation.kind == "computation":
+                # This is a CYCLOPS read projection through the durable Core
+                # reference, not a copy of Computation metadata into the
+                # Execution record.
+                payload["computation_context"] = {
+                    "id": computation.id,
+                    "name": computation.name,
+                    "description": computation.description,
+                }
+        return payload
 
     def record_path(self, record_id: str) -> Path:
         """Return the canonical on-disk JSON file for one loaded record."""
@@ -1586,6 +1598,7 @@ def load_project_graph(
             record,
             record_digest=record_digests[record_id],
             execution_states=execution_states,
+            execution_summaries=execution_summaries,
         )
         for record_id, record in sorted(records.items())
     )
@@ -1762,12 +1775,20 @@ def _node(
     *,
     record_digest: str,
     execution_states: dict[str, _InvocationExecutionSummary],
+    execution_summaries: dict[str, _InvocationSummary],
 ) -> dict[str, Any]:
     node = {
         "id": record_id,
         "kind": record.kind,
         "record_id": record.id,
-        "label": _node_label(record),
+        "label": _node_label(
+            record,
+            execution_display_name=(
+                execution_summaries[record_id].display_name
+                if record.kind == "execution"
+                else None
+            ),
+        ),
         # Canonical JSON hash is catalog integrity metadata only. Graph
         # identity and Core references use the UUID in ``id``.
         "record_digest": f"sha256:{record_digest}",
@@ -1838,9 +1859,17 @@ def _invocation_summaries(records: dict[str, Any]) -> dict[str, _InvocationSumma
         locator = record.computation.id
         if computation is not None and computation.kind == "computation":
             locator = computation.implementation.locator
+        computation_name = (
+            computation.name
+            if computation is not None and computation.kind == "computation"
+            else None
+        )
         summaries[digest] = _InvocationSummary(
             locator=locator,
-            display_name=record.name or _display_locator(locator),
+            # An Execution has no default label of its own. Its UI label is
+            # derived from the immutable Computation reference, never copied
+            # into the Execution record.
+            display_name=record.name or computation_name or _display_locator(locator),
             timeline=_invocation_timeline(record, events_by_invocation.get(digest, [])),
             legacy=record.outputs is None,
         )
@@ -1972,13 +2001,18 @@ def _display_record_id(identifier: str) -> str:
     return f"{identifier[:8]}…{identifier[-20:]}"
 
 
-def _node_label(record: Any) -> str:
-    """Use only Core-owned record fields in a uniform graph-node label."""
+def _node_label(record: Any, *, execution_display_name: str | None = None) -> str:
+    """Render a concise label without mutating or duplicating Core records."""
 
     if record.kind == "event":
         # An Event's ID is an opaque immutable record identifier. Its Core
         # event_type is the concise, semantically useful canvas label.
         return f"event\n{record.event_type}"
+    if record.kind == "execution" and execution_display_name is not None:
+        # The label is a presentation projection through Execution.computation.
+        # ``Execution.name`` remains null unless an application deliberately
+        # supplied invocation-specific text.
+        return f"execution\n{execution_display_name}"
     display_value = record.name or _display_record_id(record.id)
     kind_label = record.media_type if record.kind == "artifact" else record.kind
     return f"{kind_label}\n{display_value}"

@@ -1367,6 +1367,12 @@ function flowNodes(
   positionOverrides: Record<string, XYPosition>,
 ): Node[] {
   const columnWidth = 310;
+  // Lifecycle boundaries are presentation overlays, but their three-line
+  // header is real visible content. Reserve a header band above every direct
+  // member so a top-aligned node cannot cover the group label.
+  const lifecycleGroupSideInset = 22;
+  const lifecycleGroupHeaderInset = 84;
+  const lifecycleGroupBottomInset = 28;
   const visibleNodeIds = new Set(nodes.map((node) => node.id));
   const artifactBindingRoles = new Map<string, Set<"input" | "output">>();
   for (const edge of graph?.edges ?? []) {
@@ -1828,8 +1834,11 @@ function flowNodes(
       memberIds,
       left,
       top,
-      width: Math.max(360, right - left + 44),
-      height: Math.max(160, bottom - top + 76),
+      width: Math.max(360, right - left + lifecycleGroupSideInset * 2),
+      height: Math.max(
+        160,
+        bottom - top + lifecycleGroupHeaderInset + lifecycleGroupBottomInset,
+      ),
     }];
   });
   for (const layout of lifecycleLayouts) {
@@ -1841,7 +1850,10 @@ function flowNodes(
     rendered.push({
       id: layout.group.id,
       type: "lifecycleGroup",
-      position: { x: layout.left - 22, y: layout.top - 48 },
+      position: {
+        x: layout.left - lifecycleGroupSideInset,
+        y: layout.top - lifecycleGroupHeaderInset,
+      },
       data: {
         title: layout.group.title,
         label: layout.group.label,
@@ -2516,6 +2528,21 @@ export default function App() {
       positions[node.id] ? { ...node, position: positions[node.id] } : node,
     );
   }, [layoutScope, nodePositionsByScope, nodes]);
+  // Lifecycle boundaries and timeline ticks are CYCLOPS presentation. They
+  // must never determine the viewport: their computed geometry can be wider
+  // than the real materialization they decorate. Both Fit View and the
+  // post-layout fit deliberately use this one set of rendered record nodes.
+  const fitVisibleRecords = useCallback((duration = 260) => {
+    const recordNodes = positionedNodes
+      .filter((node) => node.type === "record")
+      .map((node) => ({ id: node.id }));
+    if (!recordNodes.length) return;
+    void flow.current?.fitView({
+      nodes: recordNodes,
+      duration,
+      padding: 0.18,
+    });
+  }, [positionedNodes]);
   const edges = useMemo(
     () =>
       flowEdges(
@@ -2586,7 +2613,7 @@ export default function App() {
     // the promise callback was the source of the stale, mostly blank canvas.
     const firstFrame = window.requestAnimationFrame(() => {
       const secondFrame = window.requestAnimationFrame(() => {
-        if (!cancelled) flow.current?.fitView({ duration: 260, padding: 0.18 });
+        if (!cancelled) fitVisibleRecords();
       });
       if (cancelled) window.cancelAnimationFrame(secondFrame);
     });
@@ -2594,7 +2621,7 @@ export default function App() {
       cancelled = true;
       window.cancelAnimationFrame(firstFrame);
     };
-  }, [layoutFitRequest]);
+  }, [fitVisibleRecords, layoutFitRequest]);
 
   const updateNodePositions = useCallback((changes: NodeChange<Node>[]) => {
     const isTimeline = displayGraph?.view === "timeline";
@@ -2637,12 +2664,12 @@ export default function App() {
   useEffect(() => {
     if (!displayGraph) return;
     const animation = requestAnimationFrame(() => {
-      flow.current?.fitView({ duration: 260, padding: 0.18 });
+      fitVisibleRecords();
     });
     return () => cancelAnimationFrame(animation);
   // A node selection only changes local styling and the detail panel. It must
   // not refit the viewport; collection expansion intentionally does.
-  }, [displayGraph, expandedCollections]);
+  }, [displayGraph, expandedCollections, fitVisibleRecords]);
 
   const clearSelectedRecord = useCallback(() => {
     selectedRecordRequest.current?.abort();
@@ -3508,7 +3535,7 @@ export default function App() {
             proOptions={{ hideAttribution: true }}
           >
             <Background color={theme.grid} gap={18} />
-            <Controls />
+            <Controls onFitView={() => fitVisibleRecords()} />
             <MiniMap
               bgColor={theme.minimap}
               maskColor={theme.minimapMask}
@@ -3536,6 +3563,23 @@ export default function App() {
             <>
               <h2>{String(selected.record.kind)}</h2>
               <p className="record-id">{String(selected.record.id)}</p>
+              {typeof selected.record.description === "string" ? (
+                <section className="record-description" aria-label="Description">
+                  <h3>Description</h3>
+                  <p>{selected.record.description}</p>
+                </section>
+              ) : null}
+              {selected.computation_context ? (
+                <section className="computation-context" aria-label="Computation">
+                  <h3>Computation</h3>
+                  <p>{selected.computation_context.name ?? "Unnamed computation"}</p>
+                  {selected.computation_context.description ? (
+                    <p className="computation-context-description">
+                      {selected.computation_context.description}
+                    </p>
+                  ) : null}
+                </section>
+              ) : null}
               {selectedCollection ? (
                 <button onClick={toggleSelectedCollection}>
                   {expandedCollections.has(selected.id)

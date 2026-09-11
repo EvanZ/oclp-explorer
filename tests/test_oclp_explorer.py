@@ -23,7 +23,7 @@ def _id(value: str) -> str:
     return str(uuid5(NAMESPACE_URL, value))
 
 
-@computation(id=_id("urn:example:computation:prepare"), name="Prepare features")
+@computation(name="Prepare features")
 def _prepare() -> None: ...
 
 
@@ -33,14 +33,13 @@ def _release_check(model: object) -> str:
 
 
 @computation(
-    id=_id("urn:example:computation:train"),
     name="Train model",
     requires=(_release_check,),
 )
 def _train() -> None: ...
 
 
-@computation(id=_id("urn:example:computation:predict"), name="Predict demand")
+@computation(name="Predict demand")
 def _predict() -> None: ...
 
 
@@ -85,6 +84,7 @@ def _fixture_store(
         model = publisher.json_artifact(
             artifact_id=_id("urn:example:artifact:model"),
             name="Model package",
+            description="Linear model selected for the candidate release.",
             relative_path="model.json",
             value={"model": "linear"},
             created_at=now + timedelta(seconds=20),
@@ -143,7 +143,6 @@ def _fixture_store(
         root_execution = publisher.publish(
             Execution(
                 id=_id("urn:example:execution:prepare:one"),
-                name="Prepare features for August",
                 profiles=run_profile,
                 computation=prepare,
                 inputs={"source": (source,)},
@@ -153,7 +152,6 @@ def _fixture_store(
         child_execution = publisher.publish(
             Execution(
                 id=_id("urn:example:execution:train:one"),
-                name="Train August candidate",
                 profiles=run_profile,
                 computation=train,
                 parent_execution=root_execution,
@@ -747,6 +745,9 @@ def test_run_index_and_api_use_execution_names(tmp_path: Path) -> None:
         indexed = index.runs_payload()
     assert "executions" in indexed["runs"][0]
     assert "invocations" not in indexed["runs"][0]
+    # Standard executions keep their labels null; Cyclops derives a readable
+    # display label through their immutable Computation reference.
+    assert indexed["runs"][0]["executions"][0]["label"] == "Prepare features"
 
     with TestClient(create_app(root)) as client:
         runs = client.get("/api/runs")
@@ -772,6 +773,17 @@ def test_api_reveals_canonical_record_and_local_artifact_payload_folders(
         detail = client.get(f"/api/records/{refs['model'].id}")
         assert detail.status_code == 200
         assert detail.json()["local_payload_available"] is True
+        assert detail.json()["record"]["description"] == (
+            "Linear model selected for the candidate release."
+        )
+
+        execution_detail = client.get(f"/api/records/{refs['root_execution'].id}")
+        assert execution_detail.status_code == 200
+        assert execution_detail.json()["record"].get("name") is None
+        computation_context = execution_detail.json()["computation_context"]
+        assert computation_context["id"] == execution_detail.json()["record"]["computation"]["id"]
+        assert computation_context["name"] == "Prepare features"
+        assert computation_context["description"] is None
 
         record_folder = client.post(
             f"/api/records/{refs['model'].id}/reveal",

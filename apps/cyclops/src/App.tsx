@@ -30,6 +30,7 @@ import {
   BrainCircuit,
   Braces,
   ChartNoAxesCombined,
+  Check,
   CircleX,
   Cog,
   Database,
@@ -785,7 +786,34 @@ function restoreGifNodeLayers(
 
 function statusLabel(status: string | undefined): string {
   const value = status || "incomplete";
+  if (value === "failed") return "Fail";
   return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function ExecutionTreeStatus({ status }: { status: string | undefined }) {
+  const resolvedStatus = status ?? "incomplete";
+
+  if (resolvedStatus === "succeeded") {
+    return (
+      <span aria-label="Succeeded" className="run-status status-succeeded" role="img">
+        <Check aria-hidden="true" size={14} strokeWidth={3} />
+      </span>
+    );
+  }
+
+  return (
+    <span aria-hidden="true" className={"run-status status-" + resolvedStatus}>
+      ●
+    </span>
+  );
+}
+
+function ExecutionTreeLabel({ execution }: { execution: RunExecution }) {
+  if (execution.status === "succeeded") {
+    return execution.label;
+  }
+
+  return <>{statusLabel(execution.status)}{" · "}{execution.label}</>;
 }
 
 function statusSummary(statusCounts: Record<string, number> | undefined): string {
@@ -3429,19 +3457,9 @@ export default function App() {
                                   diagnosticText(execution.diagnostic),
                                 ].filter(Boolean).join("\n")}
                               >
-                                <span
-                                  aria-hidden="true"
-                                  className={
-                                    "run-status status-" + (execution.status ?? "incomplete")
-                                  }
-                                >
-                                  ●
-                                </span>
+                                <ExecutionTreeStatus status={execution.status} />
                                 <span className="run-tree-invocation-copy">
-                                  <span>
-                                    {statusLabel(execution.status)}
-                                    {" · "}{execution.label}
-                                  </span>
+                                  <span><ExecutionTreeLabel execution={execution} /></span>
                                   {diagnosticText(execution.diagnostic) ? (
                                     <small>
                                       {diagnosticText(execution.diagnostic)}
@@ -3509,19 +3527,9 @@ export default function App() {
                                       diagnosticText(execution.diagnostic),
                                     ].filter(Boolean).join("\n")}
                                   >
-                                    <span
-                                      aria-hidden="true"
-                                      className={
-                                        "run-status status-" + (execution.status ?? "incomplete")
-                                      }
-                                    >
-                                      ●
-                                    </span>
+                                    <ExecutionTreeStatus status={execution.status} />
                                     <span className="run-tree-invocation-copy">
-                                      <span>
-                                        {statusLabel(execution.status)}
-                                        {" · "}{execution.label}
-                                      </span>
+                                      <span><ExecutionTreeLabel execution={execution} /></span>
                                       {diagnosticText(execution.diagnostic) ? (
                                         <small>{diagnosticText(execution.diagnostic)}</small>
                                       ) : null}
